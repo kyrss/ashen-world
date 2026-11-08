@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="ru" class="dark">
+  <head>
+    <meta charset="UTF-8" />
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover"
+    />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <meta name="theme-color" content="#090b10" />
+    <title>Ashen World — Мобильная 2D Action RPG</title>
+    <meta
+      name="description"
+      content="Ashen World — одиночная мобильная 2D Action RPG в мире после Раскола. Технический фундамент на Phaser 3 и TypeScript."
+    />
+    <meta property="og:title" content="Ashen World — Мобильная 2D Action RPG" />
+    <meta
+      property="og:description"
+      content="Одиночная мобильная 2D Action RPG в оригинальной фэнтезийной вселенной Вел'Арис."
+    />
+    <meta property="og:type" content="website" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Cinzel:wght@600;700&family=JetBrains+Mono:wght@400;600&family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap"
+      rel="stylesheet"
+    />
+  </head>
+  <body data-state="title" class="bg-[#090b10] text-[#e6e1d6] select-none overflow-hidden">
+    <main id="app-root" class="relative w-screen h-screen overflow-hidden">
+      <div id="phaser-mount" data-testid="phaser-canvas-container" class="w-full h-full"></div>
+      <div id="hud-overlay" class="fixed inset-0 pointer-events-none z-20"></div>
+    </main>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
