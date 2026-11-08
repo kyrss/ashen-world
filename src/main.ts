@@ -38,7 +38,7 @@ async function bootstrapAshenWorld(): Promise<void> {
     physics: {
       default: 'arcade',
       arcade: {
-        gravity: { x: 0, y: GAME_CONFIG.GRAVITY_Y },
+        gravity: { x: 0, y: 0 },
         debug: false,
       },
     },

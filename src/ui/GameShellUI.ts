@@ -1,8 +1,19 @@
-import { computeViewportMetrics, type GameShellState } from '../core/config';
-import { eventBus, type TelemetrySnapshot } from '../core/EventBus';
+import {
+  computeViewportMetrics,
+  formatFacingLabel,
+  type GameShellState,
+} from '../core/config';
+import {
+  eventBus,
+  type TelemetrySnapshot,
+  type WorldDialoguePayload,
+} from '../core/EventBus';
 import { computeJoystickVector, inputController } from '../input/InputController';
 import { saveManager, type SaveRecord } from '../save/SaveManager';
-import { THRESHOLD_WAYSTONES } from '../world/thresholdLayout';
+import {
+  THRESHOLD_INTERACTABLES,
+  THRESHOLD_WAYSTONES,
+} from '../world/thresholdLayout';
 
 /**
  * Pure helper to check whether a touch point remains within a button's active bounds
@@ -22,10 +33,13 @@ export function isPointWithinExpandedRect(
   );
 }
 
+type RpgDrawerTab = 'inventory' | 'journal' | null;
+
 export class GameShellUI {
   private root: HTMLElement;
   private currentState: GameShellState = 'title';
   private portraitDismissed = false;
+  private activeDrawerTab: RpgDrawerTab = null;
 
   // DOM References
   private titleLayer!: HTMLElement;
@@ -35,18 +49,36 @@ export class GameShellUI {
   private safeAreaGuideLayer!: HTMLElement;
   private toastEl!: HTMLElement;
 
+  // Top-Left RPG Hero Status & World Readout
+  private hudHeroLevelEl!: HTMLElement;
+  private hudHpBarEl!: HTMLElement;
+  private hudHpTextEl!: HTMLElement;
+  private hudMpBarEl!: HTMLElement;
+  private hudMpTextEl!: HTMLElement;
+  private hudXpBarEl!: HTMLElement;
+  private hudXpTextEl!: HTMLElement;
   private hudZoneTitleEl!: HTMLElement;
   private hudCoordsEl!: HTMLElement;
-  private hudStateEl!: HTMLElement;
+  private hudFacingEl!: HTMLElement;
   private hudWaystonesEl!: HTMLElement;
+
+  // Contextual Prompt, Dialogue Modal & RPG Drawer
   private hudWaystonePromptEl!: HTMLElement;
   private hudWaystonePromptTextEl!: HTMLElement;
-  private dashButtonEl!: HTMLButtonElement;
-  private dashCooldownLabelEl!: HTMLElement;
+  private promptActionBtnEl!: HTMLButtonElement;
+  private dialogueBannerEl!: HTMLElement;
+  private dialogueSpeakerEl!: HTMLElement;
+  private dialogueRoleEl!: HTMLElement;
+  private dialogueBodyEl!: HTMLElement;
+  private dialogueXpBadgeEl!: HTMLElement;
+
+  private rpgDrawerEl!: HTMLElement;
+  private rpgDrawerTitleEl!: HTMLElement;
+  private rpgDrawerBodyEl!: HTMLElement;
+
+  // Bottom Controls
   private interactButtonLabelEl!: HTMLElement;
   private soundToggleBtnEl!: HTMLButtonElement;
-  private jumpButtonEl!: HTMLButtonElement;
-
   private joystickBaseEl!: HTMLElement;
   private joystickKnobEl!: HTMLElement;
   private joystickVectorTextEl!: HTMLElement;
@@ -56,7 +88,6 @@ export class GameShellUI {
 
   // Independent multi-touch pointer identifiers
   private joystickTouchId: number | null = null;
-  private jumpTouchId: number | null = null;
   private pointerDragActive = false;
   private toastTimeoutId: number | null = null;
 
@@ -99,7 +130,7 @@ export class GameShellUI {
             <path d="M18 12h.01" />
           </svg>
           <p class="text-xs text-[#e6e1d6] truncate">
-            Рекомендуется горизонтальный режим (Landscape) для удобного управления двумя большими пальцами.
+            Рекомендуется горизонтальный режим (Landscape) для удобного управления RPG двумя руками.
           </p>
         </div>
         <button
@@ -116,7 +147,7 @@ export class GameShellUI {
         id="hud-toast"
         role="status"
         aria-live="polite"
-        class="opacity-0 translate-y-2 transition-all duration-150 fixed bottom-6 left-1/2 -translate-x-1/2 z-40 pointer-events-none px-3.5 py-1.5 rounded-lg bg-[#0d121d]/95 border border-amber-500/40 text-xs font-medium text-[#f3ede0] shadow-lg whitespace-nowrap"
+        class="opacity-0 translate-y-2 transition-all duration-150 fixed bottom-5 left-1/2 -translate-x-1/2 z-40 pointer-events-none px-3.5 py-1.5 rounded-lg bg-[#0d121d]/95 border border-amber-500/40 text-xs font-medium text-[#f3ede0] shadow-lg whitespace-nowrap"
       ></div>
 
       <!-- ==================== 1. TITLE SCREEN OVERLAY ==================== -->
@@ -125,21 +156,21 @@ export class GameShellUI {
         aria-label="Экран приветствия Ashen World"
         class="fixed inset-0 pointer-events-auto z-30 flex flex-col justify-between safe-pad bg-gradient-to-r from-[#07090e]/92 via-[#090c14]/78 to-transparent"
       >
-        <!-- Top Subtle World Context -->
+        <!-- Top World Context -->
         <div class="flex items-center justify-between gap-4">
           <div class="flex items-center gap-2 text-xs text-slate-400 truncate">
-            <span class="text-amber-400/90 font-medium">Этап 1 · Технический фундамент</span>
+            <span class="text-amber-400/90 font-medium">Этап 2 · Классическая 2D RPG</span>
             <span aria-hidden="true">·</span>
-            <span>Phaser 3 WebGL</span>
+            <span>8-направленное движение и Y-Sorting</span>
             <span aria-hidden="true">·</span>
             <span class="hidden sm:inline">Локация: Пепельный Рубеж</span>
           </div>
           <div class="text-xs font-mono-tabular text-slate-400 whitespace-nowrap shrink-0">
-            1280×720 · IndexedDB v1
+            1280×720 · IndexedDB v2
           </div>
         </div>
 
-        <!-- Asymmetric Left-Third Hero Lockup over Calm Negative Space -->
+        <!-- Asymmetric Left-Third Hero Lockup -->
         <div class="my-auto max-w-xl py-1">
           <div class="flex items-center gap-3.5 mb-2.5">
             <svg class="w-12 h-12 sm:w-14 sm:h-14 shrink-0" viewBox="0 0 64 64" fill="none" aria-hidden="true">
@@ -154,13 +185,13 @@ export class GameShellUI {
                 ASHEN WORLD
               </h1>
               <p class="text-xs sm:text-sm text-amber-400/90 mt-1 tracking-wide">
-                Хроники Вел'Ариса · Одиночная 2D Action RPG
+                Хроники Вел'Ариса · Одиночная фэнтезийная 2D RPG
               </p>
             </div>
           </div>
 
           <p class="text-xs sm:text-sm text-slate-300/90 leading-relaxed max-w-lg mb-3">
-            Испытательный полигон у врат древнего святилища Зодчих. Проверьте работу камеры, физики столкновений, сенсорного управления и локальных сохранений у Путевых Обелисков.
+            Исследуйте заставу Дозорных, древнее Святилище Расколотого Свода и Рощу Пепельных Древ в классической 2D-перспективе сверху под углом. Общайтесь с хранителями, изучайте скрижали и активируйте Путевые Обелиски.
           </p>
 
           <!-- IndexedDB Save Slot Status Line -->
@@ -179,7 +210,7 @@ export class GameShellUI {
               data-start="true"
               class="px-5 py-2.5 min-h-[44px] rounded-xl bg-amber-600 hover:bg-amber-500 active:scale-[0.98] text-[#090b10] font-semibold text-xs sm:text-sm tracking-wide shadow-lg cursor-pointer transition-all whitespace-nowrap shrink-0"
             >
-              Войти в Пепельный Рубеж
+              Войти в игровой мир
             </button>
             <button
               id="btn-title-reset-save"
@@ -191,54 +222,131 @@ export class GameShellUI {
           </div>
         </div>
 
-        <!-- Flat Single-Line Control Hint in Bottom Safe Margin -->
+        <!-- Flat Single-Line Control Hint -->
         <div class="text-[11px] text-slate-400 flex flex-wrap items-center justify-between gap-2 pt-1.5 border-t border-slate-800/80">
-          <span>Сенсор: Левый джойстик — движение · Правые кнопки — прыжок, рывок, обелиск</span>
-          <span class="hidden md:inline font-mono-tabular">Клавиатура: A/D · Space · Shift · E · Esc</span>
+          <span>Сенсор: Левый джойстик — движение (8 направлений) · Правая панель — действие, навыки, инвентарь и журнал</span>
+          <span class="hidden md:inline font-mono-tabular">Клавиатура: WASD / Стрелки · E / Space · I (Инвентарь) · J (Журнал) · Esc</span>
         </div>
       </section>
 
-      <!-- ==================== 2. PLAYING HUD LAYER ==================== -->
+      <!-- ==================== 2. PLAYING CLASSIC 2D RPG HUD LAYER ==================== -->
       <section
         id="layer-hud"
-        aria-label="Игровой интерфейс"
+        aria-label="Игровой интерфейс RPG"
         class="hidden fixed inset-0 pointer-events-none z-20 flex flex-col justify-between safe-pad"
       >
-        <!-- Top Row: Strictly 2 Compact Corner Clusters (Left Plaque + Right Utility Controls) -->
-        <div class="flex items-start justify-between gap-3">
-          <!-- Top-Left World-Matched Obsidian Plaque -->
-          <div class="pointer-events-auto bg-[#0d121d]/90 border border-slate-700/80 rounded-xl px-3 py-1.5 shadow-lg max-w-[310px]">
-            <div class="flex items-center justify-between gap-3">
-              <span id="hud-zone-title" class="text-xs font-semibold text-amber-400 truncate">
-                Врата Заката · Западный Бастион
-              </span>
-              <span id="hud-waystones" class="text-[11px] font-mono-tabular text-sky-300 whitespace-nowrap shrink-0">
-                Обелиски: 1/3
+        <!-- Top Row: Left RPG Hero Unit Frame + Right RPG Utility Bar -->
+        <div class="flex items-start justify-between gap-2">
+          <!-- Top-Left Hero Status Frame (Portrait Crest, Level, HP, Mana, XP, Zone) -->
+          <div
+            id="hud-hero-frame"
+            class="pointer-events-auto bg-[#0b101b]/92 border border-slate-700/85 rounded-xl px-2.5 py-1.5 shadow-xl flex items-center gap-2.5 max-w-[360px]"
+          >
+            <!-- Hero Crest & Level Badge -->
+            <div class="relative w-10 h-10 rounded-lg bg-[#141d30] border border-amber-500/60 flex items-center justify-center shrink-0">
+              <svg class="w-6 h-6 text-amber-400" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8">
+                <path d="M12 2L19 7v6c0 5-3.5 8.5-7 9-3.5-.5-7-4-7-9V7l7-5z" />
+                <circle cx="12" cy="11" r="2.5" fill="#38bdf8" stroke="none" />
+              </svg>
+              <span
+                id="hud-hero-level"
+                class="absolute -bottom-1 -right-1 px-1.5 py-0.2 rounded bg-amber-500 text-[#090b10] font-mono-tabular text-[10px] font-bold leading-tight"
+              >
+                Ур.1
               </span>
             </div>
-            <div class="flex items-center gap-2 mt-0.5 text-[11px] font-mono-tabular text-slate-300 whitespace-nowrap">
-              <span id="hud-coords">X: 340 · Y: 700</span>
-              <span aria-hidden="true">·</span>
-              <span id="hud-state" class="text-emerald-300">На опоре</span>
+
+            <!-- Vitals Bars (HP, Mana/Aether, XP) & Zone Info -->
+            <div class="min-w-0 flex-1 space-y-1">
+              <div class="flex items-center justify-between gap-2">
+                <span id="hud-zone-title" class="text-[11px] font-semibold text-amber-300 truncate">
+                  Врата Заката · Западный Тракт
+                </span>
+                <span id="hud-waystones" class="text-[10px] font-mono-tabular text-sky-300 whitespace-nowrap shrink-0">
+                  Обелиски: 1/3
+                </span>
+              </div>
+
+              <!-- Health & Mana Dual Bars -->
+              <div class="grid grid-cols-2 gap-1.5">
+                <div class="relative h-3.5 rounded bg-[#1a1118] border border-rose-900/70 overflow-hidden">
+                  <div id="hud-hp-bar" class="h-full bg-gradient-to-r from-rose-700 to-rose-500 transition-all duration-200" style="width: 100%"></div>
+                  <span id="hud-hp-text" class="absolute inset-0 flex items-center justify-center text-[9px] font-mono-tabular font-semibold text-white drop-shadow">
+                    ОЗ 120/120
+                  </span>
+                </div>
+                <div class="relative h-3.5 rounded bg-[#0f1928] border border-sky-900/70 overflow-hidden">
+                  <div id="hud-mp-bar" class="h-full bg-gradient-to-r from-sky-700 to-cyan-400 transition-all duration-200" style="width: 100%"></div>
+                  <span id="hud-mp-text" class="absolute inset-0 flex items-center justify-center text-[9px] font-mono-tabular font-semibold text-white drop-shadow">
+                    ЭФ 80/80
+                  </span>
+                </div>
+              </div>
+
+              <!-- XP Progress Strip + Coordinates & 8-Way Compass -->
+              <div class="flex items-center justify-between gap-2 text-[10px] font-mono-tabular text-slate-300">
+                <div class="flex items-center gap-1.5 min-w-0">
+                  <div class="w-14 h-1.5 rounded-full bg-slate-800 overflow-hidden shrink-0">
+                    <div id="hud-xp-bar" class="h-full bg-amber-400 transition-all duration-200" style="width: 0%"></div>
+                  </div>
+                  <span id="hud-xp-text" class="text-amber-300/90 whitespace-nowrap">ОП 0/100</span>
+                </div>
+                <div class="flex items-center gap-1.5 whitespace-nowrap">
+                  <span id="hud-coords">X: 490 · Y: 890</span>
+                  <span aria-hidden="true">·</span>
+                  <span id="hud-state" class="text-emerald-300">Восток</span>
+                </div>
+              </div>
             </div>
           </div>
 
-          <!-- Top-Right Compact Utility Controls (>= 44x44px hitboxes) -->
-          <div class="pointer-events-auto flex items-center gap-2 shrink-0">
+          <!-- Top-Right RPG System & Utility Buttons (>= 44x44px touch targets) -->
+          <div class="pointer-events-auto flex items-center gap-1.5 shrink-0">
+            <button
+              id="btn-hud-inventory"
+              type="button"
+              aria-label="Снаряжение и инвентарь"
+              title="Инвентарь и экипировка [I]"
+              tabindex="-1"
+              class="min-w-[44px] min-h-[44px] px-2.5 rounded-xl bg-[#0d121d]/90 hover:bg-[#172033] border border-slate-700/80 text-slate-200 flex items-center gap-1.5 text-xs font-medium cursor-pointer transition-colors"
+            >
+              <svg class="w-4 h-4 text-amber-400 shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <path d="M6 2L3 6v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2V6l-3-4z" />
+                <line x1="3" y1="6" x2="21" y2="6" />
+                <path d="M16 10a4 4 0 0 1-8 0" />
+              </svg>
+              <span class="hidden lg:inline whitespace-nowrap">Сумка</span>
+            </button>
+
+            <button
+              id="btn-hud-quests"
+              type="button"
+              aria-label="Журнал заданий"
+              title="Журнал заданий [J]"
+              tabindex="-1"
+              class="min-w-[44px] min-h-[44px] px-2.5 rounded-xl bg-[#0d121d]/90 hover:bg-[#172033] border border-slate-700/80 text-slate-200 flex items-center gap-1.5 text-xs font-medium cursor-pointer transition-colors"
+            >
+              <svg class="w-4 h-4 text-emerald-400 shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20" />
+                <path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z" />
+              </svg>
+              <span class="hidden lg:inline whitespace-nowrap">Журнал</span>
+            </button>
+
             <button
               id="btn-hud-save"
               type="button"
               aria-label="Сохранить прогресс"
               title="Сохранить прогресс [F]"
               tabindex="-1"
-              class="min-w-[44px] min-h-[44px] px-3 rounded-xl bg-[#0d121d]/90 hover:bg-[#172033] border border-slate-700/80 text-slate-200 flex items-center gap-1.5 text-xs font-medium cursor-pointer transition-colors"
+              class="min-w-[44px] min-h-[44px] px-2.5 rounded-xl bg-[#0d121d]/90 hover:bg-[#172033] border border-slate-700/80 text-slate-200 flex items-center gap-1.5 text-xs font-medium cursor-pointer transition-colors"
             >
               <svg class="w-4 h-4 text-sky-400 shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                 <path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z" />
                 <polyline points="17 21 17 13 7 13 7 21" />
                 <polyline points="7 3 7 8 15 8" />
               </svg>
-              <span class="hidden sm:inline whitespace-nowrap">Сохранить</span>
+              <span class="hidden xl:inline whitespace-nowrap">Сохранить</span>
             </button>
 
             <button
@@ -248,9 +356,7 @@ export class GameShellUI {
               title="Переключить звук [M]"
               tabindex="-1"
               class="min-w-[44px] min-h-[44px] rounded-xl bg-[#0d121d]/90 hover:bg-[#172033] border border-slate-700/80 text-slate-200 flex items-center justify-center cursor-pointer transition-colors"
-            >
-              <!-- Speaker Icon injected via applySettingsVisuals -->
-            </button>
+            ></button>
 
             <button
               id="btn-hud-pause"
@@ -258,7 +364,7 @@ export class GameShellUI {
               aria-label="Меню и пауза"
               title="Меню и пауза [P / Esc]"
               tabindex="-1"
-              class="min-w-[44px] min-h-[44px] px-3 rounded-xl bg-[#0d121d]/90 hover:bg-[#172033] border border-amber-500/50 text-amber-300 flex items-center gap-1.5 text-xs font-medium cursor-pointer transition-colors"
+              class="min-w-[44px] min-h-[44px] px-2.5 rounded-xl bg-[#0d121d]/90 hover:bg-[#172033] border border-amber-500/50 text-amber-300 flex items-center gap-1.5 text-xs font-medium cursor-pointer transition-colors"
             >
               <svg class="w-4 h-4 shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                 <rect x="6" y="4" width="4" height="16" rx="1" />
@@ -269,10 +375,10 @@ export class GameShellUI {
           </div>
         </div>
 
-        <!-- Contextual Waystone Banner (Positioned below top bar center so it never collides with bottom thumb controls even on 667x375) -->
+        <!-- Contextual World Interaction Prompt Banner (Waystone / NPC / Shrine / Chest) -->
         <div
           id="hud-waystone-prompt"
-          class="hidden pointer-events-auto fixed top-[64px] left-1/2 -translate-x-1/2 z-30 bg-[#131a29]/95 border border-amber-500/60 rounded-xl px-3 py-1.5 shadow-xl flex items-center gap-2.5"
+          class="hidden pointer-events-auto fixed top-[68px] left-1/2 -translate-x-1/2 z-30 bg-[#111827]/95 border border-amber-500/60 rounded-xl px-3 py-1.5 shadow-xl flex items-center gap-2.5"
         >
           <svg class="w-4 h-4 text-amber-400 shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
             <path d="M12 2L17 12L12 22L7 12L12 2Z" />
@@ -285,13 +391,67 @@ export class GameShellUI {
             type="button"
             class="px-2.5 py-1 min-h-[32px] rounded-lg bg-amber-500/20 hover:bg-amber-500/30 border border-amber-400/50 text-amber-300 text-xs font-medium cursor-pointer whitespace-nowrap"
           >
-            Резонанс [E]
+            Взаимодействие [E]
           </button>
         </div>
 
-        <!-- Bottom Row: Ergonomic Left Virtual Thumbstick + Right Thumb Action Arc -->
-        <div class="flex items-end justify-between gap-4 pb-1">
-          <!-- Left Virtual Analog Thumbstick -->
+        <!-- In-World NPC Dialogue & Lore Inspection Panel -->
+        <div
+          id="hud-dialogue-panel"
+          role="dialog"
+          aria-label="Диалог и описание объекта"
+          class="hidden pointer-events-auto fixed top-[70px] left-1/2 -translate-x-1/2 z-30 w-[92%] max-w-lg bg-[#0d1320]/96 border border-amber-500/60 rounded-2xl p-3.5 shadow-2xl"
+        >
+          <div class="flex items-center justify-between gap-2 pb-1.5 border-b border-slate-800">
+            <div class="min-w-0">
+              <div id="dialogue-speaker" class="font-display text-sm font-bold text-amber-300 truncate">
+                Хранитель Каэлен
+              </div>
+              <div id="dialogue-role" class="text-[11px] text-slate-400 truncate">
+                Командор Заставы Вел'Ариса
+              </div>
+            </div>
+            <div class="flex items-center gap-2 shrink-0">
+              <span id="dialogue-xp-badge" class="hidden px-2 py-0.5 rounded bg-emerald-500/20 border border-emerald-400/40 text-emerald-300 text-[10px] font-mono-tabular font-semibold">
+                +40 ОП
+              </span>
+              <button
+                id="btn-dialogue-close"
+                type="button"
+                class="px-2.5 py-1 min-h-[32px] rounded-lg bg-[#182236] hover:bg-[#22304c] text-slate-200 border border-slate-700 text-xs font-medium cursor-pointer"
+              >
+                Закрыть
+              </button>
+            </div>
+          </div>
+          <div id="dialogue-body" class="mt-2 text-xs text-slate-200 leading-relaxed space-y-1.5"></div>
+        </div>
+
+        <!-- RPG Foundation Drawer (Inventory / Quest Journal) -->
+        <div
+          id="rpg-drawer-panel"
+          role="dialog"
+          aria-label="Панель персонажа и журнала"
+          class="hidden pointer-events-auto fixed top-[58px] right-4 z-30 w-[90%] max-w-sm max-h-[calc(100vh-148px)] flex flex-col bg-[#0d1320]/96 border border-slate-700/90 rounded-2xl p-3 shadow-2xl"
+        >
+          <div class="flex items-center justify-between gap-2 pb-1.5 border-b border-slate-800 shrink-0">
+            <h3 id="rpg-drawer-title" class="font-display text-sm font-bold text-amber-300">
+              Журнал странствий
+            </h3>
+            <button
+              id="btn-drawer-close"
+              type="button"
+              class="px-2.5 py-1 min-h-[30px] rounded-lg bg-[#182236] hover:bg-[#22304c] text-slate-200 border border-slate-700 text-xs font-medium cursor-pointer"
+            >
+              Закрыть
+            </button>
+          </div>
+          <div id="rpg-drawer-body" class="mt-1.5 text-xs text-slate-300 space-y-1.5 flex-1 overflow-y-auto pr-0.5"></div>
+        </div>
+
+        <!-- Bottom Row: Left 8-Directional Virtual Thumbstick + Right RPG Skill Bar & Context Action -->
+        <div class="flex items-end justify-between gap-3 pb-1">
+          <!-- Left Virtual Analog 8-Direction Thumbstick -->
           <div class="pointer-events-auto flex items-end gap-2.5">
             <div
               id="virtual-joystick-zone"
@@ -301,85 +461,120 @@ export class GameShellUI {
               aria-valuemin="-1"
               aria-valuemax="1"
               aria-valuenow="0"
-              class="relative w-28 h-28 sm:w-32 sm:h-32 rounded-full bg-[#0d121d]/80 border-2 border-slate-600/70 shadow-xl flex items-center justify-center touch-none cursor-grab active:cursor-grabbing"
+              class="relative w-28 h-28 sm:w-32 sm:h-32 rounded-full bg-[#0d121d]/82 border-2 border-slate-600/75 shadow-xl flex items-center justify-center touch-none cursor-grab active:cursor-grabbing"
             >
-              <!-- Cardinal directional notches -->
-              <span class="absolute top-2 left-1/2 -translate-x-1/2 w-1.5 h-1.5 rounded-full bg-slate-500/60"></span>
+              <!-- 8-directional compass notches -->
+              <span class="absolute top-2 left-1/2 -translate-x-1/2 w-1.5 h-1.5 rounded-full bg-amber-400/60"></span>
               <span class="absolute bottom-2 left-1/2 -translate-x-1/2 w-1.5 h-1.5 rounded-full bg-slate-500/60"></span>
               <span class="absolute left-2 top-1/2 -translate-y-1/2 w-1.5 h-1.5 rounded-full bg-slate-500/60"></span>
               <span class="absolute right-2 top-1/2 -translate-y-1/2 w-1.5 h-1.5 rounded-full bg-slate-500/60"></span>
 
-              <!-- Inner ring (strictly absolute centered) -->
+              <!-- Inner ring -->
               <div class="absolute inset-0 m-auto w-14 h-14 sm:w-16 sm:h-16 rounded-full border border-slate-700/60 pointer-events-none"></div>
 
-              <!-- Movable Thumb Knob (dead-center at rest) -->
+              <!-- Movable Thumb Knob -->
               <div
                 id="virtual-joystick-knob"
-                class="relative w-11 h-11 sm:w-12 sm:h-12 rounded-full bg-gradient-to-b from-slate-700 to-slate-900 border-2 border-amber-400/80 shadow-md flex items-center justify-center pointer-events-none transition-transform duration-75"
+                class="relative w-11 h-11 sm:w-12 sm:h-12 rounded-full bg-gradient-to-b from-slate-700 to-slate-900 border-2 border-amber-400/85 shadow-md flex items-center justify-center pointer-events-none transition-transform duration-75"
               >
                 <div class="w-3 h-3 rounded-full bg-amber-400/90"></div>
               </div>
             </div>
 
-            <div class="hidden md:block text-[11px] font-mono-tabular text-slate-400 bg-[#0d121d]/80 px-2.5 py-1.5 rounded-lg border border-slate-800">
-              <div class="text-slate-300 font-medium">Джойстик</div>
-              <div id="joystick-vector-text">Ось X: 0.00</div>
+            <div class="hidden md:block text-[11px] font-mono-tabular text-slate-400 bg-[#0d121d]/85 px-2.5 py-1.5 rounded-lg border border-slate-800">
+              <div class="text-slate-300 font-medium">8 направлений</div>
+              <div id="joystick-vector-text">X: 0.00 · Y: 0.00</div>
             </div>
           </div>
 
-          <!-- Right Ergonomic Thumb Action Arc (Jump, Dash, Waystone Attune) -->
-          <div class="pointer-events-auto flex items-end gap-2.5 sm:gap-3">
-            <!-- Interact / Attune Waystone Button -->
+          <!-- Right RPG Skill Slots Foundation + Primary Contextual Interact Button -->
+          <div class="pointer-events-auto flex items-end gap-2 sm:gap-2.5">
+            <!-- 4-Slot RPG Skill Bar Foundation (Stage 2 HUD architecture) -->
+            <div
+              id="rpg-skill-bar"
+              role="group"
+              aria-label="Панель навыков персонажа"
+              class="flex items-center gap-1.5 bg-[#0b101b]/90 border border-slate-700/80 rounded-2xl p-1.5 shadow-xl"
+            >
+              <button
+                type="button"
+                data-skill-slot="1"
+                data-skill-name="Клинок Пепла"
+                aria-label="Навык 1: Клинок Пепла"
+                tabindex="-1"
+                class="w-11 h-11 sm:w-12 sm:h-12 rounded-xl bg-[#131c2e] hover:bg-[#1b2740] active:scale-95 border border-amber-500/40 text-amber-300 flex flex-col items-center justify-center cursor-pointer transition-transform"
+              >
+                <svg class="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                  <path d="M14.5 17.5L3 6V3h3l11.5 11.5" />
+                  <path d="M13 19l6-6" />
+                  <path d="M16 16l4 4" />
+                </svg>
+                <span class="text-[9px] font-mono-tabular text-slate-300 mt-0.5">I</span>
+              </button>
+
+              <button
+                type="button"
+                data-skill-slot="2"
+                data-skill-name="Эфирный Щит"
+                aria-label="Навык 2: Эфирный Щит"
+                tabindex="-1"
+                class="w-11 h-11 sm:w-12 sm:h-12 rounded-xl bg-[#131c2e] hover:bg-[#1b2740] active:scale-95 border border-sky-500/40 text-sky-300 flex flex-col items-center justify-center cursor-pointer transition-transform"
+              >
+                <svg class="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                  <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z" />
+                </svg>
+                <span class="text-[9px] font-mono-tabular text-slate-300 mt-0.5">II</span>
+              </button>
+
+              <button
+                type="button"
+                data-skill-slot="3"
+                data-skill-name="Печать Зодчих"
+                aria-label="Навык 3: Печать Зодчих"
+                tabindex="-1"
+                class="w-11 h-11 sm:w-12 sm:h-12 rounded-xl bg-[#131c2e] hover:bg-[#1b2740] active:scale-95 border border-emerald-500/40 text-emerald-300 flex flex-col items-center justify-center cursor-pointer transition-transform"
+              >
+                <svg class="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                  <polygon points="12 2 15 9 22 9 17 14 19 21 12 17 5 21 7 14 2 9 9 9" />
+                </svg>
+                <span class="text-[9px] font-mono-tabular text-slate-300 mt-0.5">III</span>
+              </button>
+
+              <button
+                type="button"
+                data-skill-slot="4"
+                data-skill-name="Шаг Разлома"
+                aria-label="Навык 4: Шаг Разлома"
+                tabindex="-1"
+                class="w-11 h-11 sm:w-12 sm:h-12 rounded-xl bg-[#131c2e] hover:bg-[#1b2740] active:scale-95 border border-purple-500/40 text-purple-300 flex flex-col items-center justify-center cursor-pointer transition-transform"
+              >
+                <svg class="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                  <path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z" />
+                </svg>
+                <span class="text-[9px] font-mono-tabular text-slate-300 mt-0.5">IV</span>
+              </button>
+            </div>
+
+            <!-- Primary Contextual RPG Interact / Action Button -->
             <button
               id="btn-touch-interact"
               type="button"
-              aria-label="Обелиск и сохранение"
+              aria-label="Контекстное действие и взаимодействие"
               tabindex="-1"
-              class="w-14 h-14 sm:w-16 sm:h-16 rounded-2xl bg-[#101827]/90 hover:bg-[#19253b] active:scale-95 border-2 border-amber-500/60 text-amber-300 shadow-lg flex flex-col items-center justify-center gap-0.5 cursor-pointer transition-transform"
+              class="w-16 h-16 sm:w-20 sm:h-20 rounded-full bg-amber-600/95 hover:bg-amber-500 active:scale-95 border-2 border-amber-300 text-[#090b10] shadow-xl flex flex-col items-center justify-center gap-0.5 cursor-pointer transition-transform shrink-0"
             >
-              <svg class="w-5 h-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <svg class="w-6 h-6" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2">
                 <path d="M12 2L17 12L12 22L7 12L12 2Z" />
               </svg>
-              <span id="label-touch-interact" class="text-[10px] font-semibold tracking-tight whitespace-nowrap">
-                Обелиск
+              <span id="label-touch-interact" class="text-[10px] sm:text-[11px] font-bold tracking-tight whitespace-nowrap px-1">
+                Действие
               </span>
-            </button>
-
-            <!-- Impulse Dash Button -->
-            <button
-              id="btn-touch-dash"
-              type="button"
-              aria-label="Импульсный рывок"
-              tabindex="-1"
-              class="w-14 h-14 sm:w-16 sm:h-16 mb-2.5 sm:mb-3 rounded-2xl bg-[#101827]/90 hover:bg-[#19253b] active:scale-95 border-2 border-sky-400/70 text-sky-300 shadow-lg flex flex-col items-center justify-center gap-0.5 cursor-pointer transition-transform"
-            >
-              <svg class="w-5 h-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                <path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z" />
-              </svg>
-              <span id="label-touch-dash" class="text-[10px] font-semibold font-mono-tabular tracking-tight whitespace-nowrap">
-                Рывок
-              </span>
-            </button>
-
-            <!-- Primary Jump Button -->
-            <button
-              id="btn-touch-jump"
-              type="button"
-              aria-label="Прыжок"
-              tabindex="-1"
-              class="w-16 h-16 sm:w-20 sm:h-20 rounded-full bg-amber-600/90 hover:bg-amber-500 active:scale-95 border-2 border-amber-300 text-[#090b10] shadow-xl flex flex-col items-center justify-center gap-0.5 cursor-pointer transition-transform"
-            >
-              <svg class="w-6 h-6" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4">
-                <path d="M12 19V5" />
-                <path d="M5 12l7-7 7 7" />
-              </svg>
-              <span class="text-xs font-bold tracking-tight whitespace-nowrap">Прыжок</span>
             </button>
           </div>
         </div>
       </section>
 
-      <!-- ==================== 3. PAUSE & FOUNDATION INSPECTOR MODAL ==================== -->
+      <!-- ==================== 3. PAUSE & RPG INSPECTOR MODAL ==================== -->
       <section
         id="layer-pause"
         role="dialog"
@@ -391,10 +586,10 @@ export class GameShellUI {
           <div class="flex items-center justify-between gap-3 pb-2.5 border-b border-slate-800">
             <div>
               <h2 id="pause-modal-title" class="font-display text-base sm:text-xl font-bold text-[#f5efe4]">
-                Пауза · Технический паспорт Этапа 1
+                Пауза · Хроники Пепельного Рубежа
               </h2>
               <p class="text-[11px] sm:text-xs text-slate-400 mt-0.5">
-                Управление локальными сохранениями IndexedDB и настройками мобильного экрана
+                Управление локальными сохранениями IndexedDB (схема v2) и настройками экрана
               </p>
             </div>
             <button
@@ -471,17 +666,34 @@ export class GameShellUI {
     this.safeAreaGuideLayer = this.root.querySelector('#safe-area-guide')!;
     this.toastEl = this.root.querySelector('#hud-toast')!;
 
+    this.hudHeroLevelEl = this.root.querySelector('#hud-hero-level')!;
+    this.hudHpBarEl = this.root.querySelector('#hud-hp-bar')!;
+    this.hudHpTextEl = this.root.querySelector('#hud-hp-text')!;
+    this.hudMpBarEl = this.root.querySelector('#hud-mp-bar')!;
+    this.hudMpTextEl = this.root.querySelector('#hud-mp-text')!;
+    this.hudXpBarEl = this.root.querySelector('#hud-xp-bar')!;
+    this.hudXpTextEl = this.root.querySelector('#hud-xp-text')!;
     this.hudZoneTitleEl = this.root.querySelector('#hud-zone-title')!;
     this.hudCoordsEl = this.root.querySelector('#hud-coords')!;
-    this.hudStateEl = this.root.querySelector('#hud-state')!;
+    this.hudFacingEl = this.root.querySelector('#hud-state')!;
     this.hudWaystonesEl = this.root.querySelector('#hud-waystones')!;
+
     this.hudWaystonePromptEl = this.root.querySelector('#hud-waystone-prompt')!;
     this.hudWaystonePromptTextEl = this.root.querySelector('#hud-waystone-prompt-text')!;
-    this.dashButtonEl = this.root.querySelector('#btn-touch-dash')!;
-    this.dashCooldownLabelEl = this.root.querySelector('#label-touch-dash')!;
+    this.promptActionBtnEl = this.root.querySelector('#btn-prompt-attune')!;
+
+    this.dialogueBannerEl = this.root.querySelector('#hud-dialogue-panel')!;
+    this.dialogueSpeakerEl = this.root.querySelector('#dialogue-speaker')!;
+    this.dialogueRoleEl = this.root.querySelector('#dialogue-role')!;
+    this.dialogueBodyEl = this.root.querySelector('#dialogue-body')!;
+    this.dialogueXpBadgeEl = this.root.querySelector('#dialogue-xp-badge')!;
+
+    this.rpgDrawerEl = this.root.querySelector('#rpg-drawer-panel')!;
+    this.rpgDrawerTitleEl = this.root.querySelector('#rpg-drawer-title')!;
+    this.rpgDrawerBodyEl = this.root.querySelector('#rpg-drawer-body')!;
+
     this.interactButtonLabelEl = this.root.querySelector('#label-touch-interact')!;
     this.soundToggleBtnEl = this.root.querySelector('#btn-hud-sound')!;
-    this.jumpButtonEl = this.root.querySelector('#btn-touch-jump')!;
 
     this.joystickBaseEl = this.root.querySelector('#virtual-joystick-zone')!;
     this.joystickKnobEl = this.root.querySelector('#virtual-joystick-knob')!;
@@ -501,6 +713,8 @@ export class GameShellUI {
     const titleResetBtn = this.root.querySelector('#btn-title-reset-save') as HTMLButtonElement;
     titleResetBtn.addEventListener('click', () => {
       titleResetBtn.blur();
+      startBtn.disabled = true;
+      titleResetBtn.disabled = true;
       void saveManager
         .resetSave()
         .then((fresh) => {
@@ -511,6 +725,10 @@ export class GameShellUI {
         .catch((err: unknown) => {
           const reason = err instanceof Error ? err.message : 'Сбой сброса сохранения';
           eventBus.emit('save:failed', { reason });
+        })
+        .finally(() => {
+          startBtn.disabled = false;
+          titleResetBtn.disabled = false;
         });
     });
 
@@ -520,7 +738,35 @@ export class GameShellUI {
         this.transitionTo('playing');
       } else if (e.code === 'KeyM') {
         this.toggleSoundSetting();
+      } else if (this.currentState === 'playing') {
+        if (e.code === 'KeyI') {
+          this.toggleRpgDrawer('inventory');
+        } else if (e.code === 'KeyJ') {
+          this.toggleRpgDrawer('journal');
+        }
       }
+    });
+
+    const invBtn = this.root.querySelector('#btn-hud-inventory') as HTMLButtonElement;
+    invBtn.addEventListener('click', (e) => {
+      (e.currentTarget as HTMLElement).blur();
+      this.toggleRpgDrawer('inventory');
+    });
+
+    const questsBtn = this.root.querySelector('#btn-hud-quests') as HTMLButtonElement;
+    questsBtn.addEventListener('click', (e) => {
+      (e.currentTarget as HTMLElement).blur();
+      this.toggleRpgDrawer('journal');
+    });
+
+    const drawerCloseBtn = this.root.querySelector('#btn-drawer-close') as HTMLButtonElement;
+    drawerCloseBtn.addEventListener('click', () => {
+      this.closeRpgDrawer();
+    });
+
+    const dialogueCloseBtn = this.root.querySelector('#btn-dialogue-close') as HTMLButtonElement;
+    dialogueCloseBtn.addEventListener('click', () => {
+      this.dialogueBannerEl.classList.add('hidden');
     });
 
     const hudSaveBtn = this.root.querySelector('#btn-hud-save') as HTMLButtonElement;
@@ -540,8 +786,7 @@ export class GameShellUI {
       this.transitionTo('paused');
     });
 
-    const promptAttuneBtn = this.root.querySelector('#btn-prompt-attune') as HTMLButtonElement;
-    promptAttuneBtn.addEventListener('click', (e) => {
+    this.promptActionBtnEl.addEventListener('click', (e) => {
       (e.currentTarget as HTMLElement).blur();
       inputController.triggerTouchInteract();
     });
@@ -599,6 +844,17 @@ export class GameShellUI {
       this.portraitBanner.classList.add('hidden');
     });
 
+    // Bind RPG skill bar slots
+    const skillButtons = this.root.querySelectorAll<HTMLButtonElement>('[data-skill-slot]');
+    skillButtons.forEach((btn) => {
+      btn.addEventListener('click', () => {
+        btn.blur();
+        const slot = btn.dataset.skillSlot;
+        const name = btn.dataset.skillName || 'Навык';
+        this.showToast(`Ячейка навыка ${slot} («${name}») — боевые умения откроются на Этапе 3`);
+      });
+    });
+
     this.bindVirtualJoystickAndMultiTouch();
     this.bindActionButtons();
 
@@ -612,8 +868,15 @@ export class GameShellUI {
       this.updateTelemetryHUD(snap);
     });
 
+    eventBus.on('world:interacted', (payload) => {
+      this.openDialogueBanner(payload);
+    });
+
     eventBus.on('save:completed', (save) => {
       this.refreshSaveReadouts(save);
+      if (this.activeDrawerTab) {
+        this.renderRpgDrawerContent(this.activeDrawerTab);
+      }
     });
 
     eventBus.on('save:failed', ({ reason }) => {
@@ -627,6 +890,104 @@ export class GameShellUI {
     window.addEventListener('resize', () => {
       this.checkViewportOrientation();
     });
+  }
+
+  private toggleRpgDrawer(tab: 'inventory' | 'journal'): void {
+    if (this.activeDrawerTab === tab) {
+      this.closeRpgDrawer();
+      return;
+    }
+    this.activeDrawerTab = tab;
+    this.dialogueBannerEl.classList.add('hidden');
+    this.rpgDrawerEl.classList.remove('hidden');
+    this.renderRpgDrawerContent(tab);
+  }
+
+  private closeRpgDrawer(): void {
+    this.activeDrawerTab = null;
+    this.rpgDrawerEl.classList.add('hidden');
+  }
+
+  private renderRpgDrawerContent(tab: 'inventory' | 'journal'): void {
+    const save = saveManager.getCurrentSave();
+    const discoveredSet = new Set(save.discoveredInteractables);
+    const wsSet = new Set(save.discoveredWaystones);
+
+    if (tab === 'inventory') {
+      this.rpgDrawerTitleEl.textContent = 'Снаряжение и походная сумка';
+      const hasReliquary = discoveredSet.has('chest_sentinel_reliquary');
+      this.rpgDrawerBodyEl.innerHTML = `
+        <div class="p-2 rounded-lg bg-[#090d16] border border-slate-800">
+          <div class="text-amber-300 font-semibold">Эйден · Страж Пепельного Разлома</div>
+          <div class="text-[11px] text-slate-400 mt-0.5">
+            Уровень ${save.heroStats.level} · Опыт: ${save.heroStats.xp}/${save.heroStats.xpToNext} · ОЗ ${save.heroStats.hp}/${save.heroStats.maxHp}
+          </div>
+        </div>
+        <div class="grid grid-cols-2 gap-1.5 text-[11px]">
+          <div class="p-2 rounded-lg bg-[#131b2c] border border-slate-700/70">
+            <div class="text-slate-400">Оружие</div>
+            <div class="text-slate-200 font-medium">Рунный клинок Стража</div>
+          </div>
+          <div class="p-2 rounded-lg bg-[#131b2c] border border-slate-700/70">
+            <div class="text-slate-400">Доспех</div>
+            <div class="text-slate-200 font-medium">Кираса Дозора Вел'Ариса</div>
+          </div>
+          <div class="p-2 rounded-lg bg-[#131b2c] border border-slate-700/70">
+            <div class="text-slate-400">Трофей ларя</div>
+            <div class="${hasReliquary ? 'text-sky-300 font-medium' : 'text-slate-500'}">
+              ${hasReliquary ? 'Малый эфирный кристалл' : 'Не найдено (осмотрите ларь)'}
+            </div>
+          </div>
+          <div class="p-2 rounded-lg bg-[#131b2c] border border-slate-700/70">
+            <div class="text-slate-400">Реликвия</div>
+            <div class="${hasReliquary ? 'text-amber-300 font-medium' : 'text-slate-500'}">
+              ${hasReliquary ? 'Печать Дозорного' : 'Пустой слот'}
+            </div>
+          </div>
+        </div>
+      `;
+    } else {
+      this.rpgDrawerTitleEl.textContent = 'Журнал поручений · Пепельный Рубеж';
+      const itemsHtml = THRESHOLD_INTERACTABLES.map((item) => {
+        const done = discoveredSet.has(item.id);
+        return `
+          <div class="flex items-center justify-between gap-2 py-1 border-b border-slate-800/70">
+            <span class="${done ? 'text-emerald-300' : 'text-slate-300'}">${item.name}</span>
+            <span class="text-[10px] font-mono-tabular ${done ? 'text-emerald-400' : 'text-amber-400'}">
+              ${done ? 'Изучено' : item.actionLabel}
+            </span>
+          </div>
+        `;
+      }).join('');
+
+      this.rpgDrawerBodyEl.innerHTML = `
+        <div class="p-2 rounded-lg bg-[#090d16] border border-slate-800 text-[11px]">
+          <div class="text-amber-300 font-semibold">Задание: Разведка Пепельного Рубежа</div>
+          <div class="text-slate-400 mt-0.5">
+            Пробудите 3 Путевых Обелиска (${wsSet.size}/${THRESHOLD_WAYSTONES.length}) и осмотрите ключевые точки заставы (${discoveredSet.size}/${THRESHOLD_INTERACTABLES.length}).
+          </div>
+        </div>
+        <div class="space-y-0.5">${itemsHtml}</div>
+      `;
+    }
+  }
+
+  private openDialogueBanner(payload: WorldDialoguePayload): void {
+    this.closeRpgDrawer();
+    this.dialogueSpeakerEl.textContent = payload.speakerName;
+    this.dialogueRoleEl.textContent = payload.roleTitle;
+    this.dialogueBodyEl.innerHTML = payload.lines
+      .map((line) => `<p>${line}</p>`)
+      .join('');
+
+    if (payload.xpGranted > 0) {
+      this.dialogueXpBadgeEl.textContent = `+${payload.xpGranted} ОП`;
+      this.dialogueXpBadgeEl.classList.remove('hidden');
+    } else {
+      this.dialogueXpBadgeEl.classList.add('hidden');
+    }
+
+    this.dialogueBannerEl.classList.remove('hidden');
   }
 
   private updateJoystickFromClientCoords(clientX: number, clientY: number): void {
@@ -646,7 +1007,7 @@ export class GameShellUI {
     inputController.setJoystickState(vec);
     this.joystickKnobEl.style.transform = `translate3d(${vec.knobOffsetX}px, ${vec.knobOffsetY}px, 0)`;
     this.joystickBaseEl.setAttribute('aria-valuenow', String(vec.x));
-    this.joystickVectorTextEl.textContent = `Ось X: ${vec.x.toFixed(2)}`;
+    this.joystickVectorTextEl.textContent = `X: ${vec.x.toFixed(2)} · Y: ${vec.y.toFixed(2)}`;
   }
 
   private resetJoystickVisuals(): void {
@@ -662,16 +1023,10 @@ export class GameShellUI {
     });
     this.joystickKnobEl.style.transform = 'translate3d(0px, 0px, 0)';
     this.joystickBaseEl.setAttribute('aria-valuenow', '0');
-    this.joystickVectorTextEl.textContent = 'Ось X: 0.00';
-  }
-
-  private releaseJumpTouch(): void {
-    this.jumpTouchId = null;
-    inputController.triggerTouchJump(false);
+    this.joystickVectorTextEl.textContent = 'X: 0.00 · Y: 0.00';
   }
 
   private bindVirtualJoystickAndMultiTouch(): void {
-    // Use targetTouches[0] so simultaneous touches on right-hand buttons never hijack the joystick ID
     this.joystickBaseEl.addEventListener(
       'touchstart',
       (e) => {
@@ -693,12 +1048,6 @@ export class GameShellUI {
           if (this.joystickTouchId !== null && t.identifier === this.joystickTouchId) {
             this.updateJoystickFromClientCoords(t.clientX, t.clientY);
           }
-          if (this.jumpTouchId !== null && t.identifier === this.jumpTouchId) {
-            const jumpRect = this.jumpButtonEl.getBoundingClientRect();
-            if (!isPointWithinExpandedRect(t.clientX, t.clientY, jumpRect, 28)) {
-              this.releaseJumpTouch();
-            }
-          }
         }
       },
       { passive: false }
@@ -710,22 +1059,16 @@ export class GameShellUI {
         if (this.joystickTouchId !== null && id === this.joystickTouchId) {
           this.resetJoystickVisuals();
         }
-        if (this.jumpTouchId !== null && id === this.jumpTouchId) {
-          this.releaseJumpTouch();
-        }
       }
     };
 
     window.addEventListener('touchend', handleGlobalTouchEndOrCancel);
     window.addEventListener('touchcancel', handleGlobalTouchEndOrCancel);
 
-    // Clear all touch/pointer states on window blur or visibility loss
     window.addEventListener('blur', () => {
       this.resetJoystickVisuals();
-      this.releaseJumpTouch();
     });
 
-    // Mouse / Pointer events for desktop verification
     this.joystickBaseEl.addEventListener('mousedown', (e) => {
       e.preventDefault();
       this.pointerDragActive = true;
@@ -745,66 +1088,20 @@ export class GameShellUI {
   }
 
   private bindActionButtons(): void {
-    const dashBtn = this.root.querySelector('#btn-touch-dash') as HTMLButtonElement;
     const interactBtn = this.root.querySelector('#btn-touch-interact') as HTMLButtonElement;
-
-    // Multi-touch isolated Jump button
-    this.jumpButtonEl.addEventListener(
-      'touchstart',
-      (e) => {
-        e.preventDefault();
-        const touch = e.targetTouches[0] || e.changedTouches[0];
-        if (touch) {
-          this.jumpTouchId = touch.identifier;
-        }
-        inputController.triggerTouchJump(true);
-      },
-      { passive: false }
-    );
-
-    this.jumpButtonEl.addEventListener(
-      'touchend',
-      (e) => {
-        e.preventDefault();
-        this.releaseJumpTouch();
-      },
-      { passive: false }
-    );
-
-    this.jumpButtonEl.addEventListener(
-      'touchcancel',
-      (e) => {
-        e.preventDefault();
-        this.releaseJumpTouch();
-      },
-      { passive: false }
-    );
-
-    this.jumpButtonEl.addEventListener('mousedown', (e) => {
-      e.preventDefault();
-      inputController.triggerTouchJump(true);
-    });
-    this.jumpButtonEl.addEventListener('mouseup', (e) => {
-      e.preventDefault();
-      inputController.triggerTouchJump(false);
-    });
-    this.jumpButtonEl.addEventListener('mouseleave', () => {
-      inputController.triggerTouchJump(false);
-    });
-
-    const triggerDash = (e: Event) => {
-      e.preventDefault();
-      inputController.triggerTouchDash();
-    };
-    dashBtn.addEventListener('touchstart', triggerDash, { passive: false });
-    dashBtn.addEventListener('mousedown', triggerDash);
-
+    let lastTriggerAt = 0;
     const triggerInteract = (e: Event) => {
-      e.preventDefault();
+      if (e.type === 'touchstart') {
+        e.preventDefault();
+      }
+      const now = performance.now();
+      if (now - lastTriggerAt < 180) return;
+      lastTriggerAt = now;
       inputController.triggerTouchInteract();
     };
     interactBtn.addEventListener('touchstart', triggerInteract, { passive: false });
     interactBtn.addEventListener('mousedown', triggerInteract);
+    interactBtn.addEventListener('click', triggerInteract);
   }
 
   public transitionTo(nextState: GameShellState): void {
@@ -818,7 +1115,7 @@ export class GameShellUI {
 
     if (nextState !== 'playing') {
       this.resetJoystickVisuals();
-      this.releaseJumpTouch();
+      this.closeRpgDrawer();
     }
 
     this.titleLayer.classList.toggle('hidden', nextState !== 'title');
@@ -833,35 +1130,36 @@ export class GameShellUI {
   private updateTelemetryHUD(snap: TelemetrySnapshot): void {
     this.hudZoneTitleEl.textContent = snap.zoneTitle;
     this.hudCoordsEl.textContent = `X: ${snap.x} · Y: ${snap.y}`;
+    this.hudFacingEl.textContent = formatFacingLabel(snap.facing);
+    this.hudWaystonesEl.textContent = `Обелиски: ${snap.discoveredWaystonesCount}/${snap.totalWaystones}`;
 
-    if (snap.dashing) {
-      this.hudStateEl.textContent = 'Импульсный шаг';
-      this.hudStateEl.className = 'text-sky-300';
-    } else if (snap.grounded) {
-      this.hudStateEl.textContent = 'На опоре';
-      this.hudStateEl.className = 'text-emerald-300';
-    } else {
-      this.hudStateEl.textContent = 'В воздухе';
-      this.hudStateEl.className = 'text-amber-300';
-    }
+    // Hero Level, HP, Mana, XP
+    const stats = snap.heroStats;
+    this.hudHeroLevelEl.textContent = `Ур.${stats.level}`;
+    const hpPct = Math.max(0, Math.min(100, Math.round((stats.hp / stats.maxHp) * 100)));
+    const mpPct = Math.max(0, Math.min(100, Math.round((stats.mana / stats.maxMana) * 100)));
+    const xpPct = Math.max(0, Math.min(100, Math.round((stats.xp / stats.xpToNext) * 100)));
 
-    this.hudWaystonesEl.textContent = `Обелиски: ${snap.discoveredCount}/${snap.totalWaystones}`;
+    this.hudHpBarEl.style.width = `${hpPct}%`;
+    this.hudHpTextEl.textContent = `ОЗ ${stats.hp}/${stats.maxHp}`;
+    this.hudMpBarEl.style.width = `${mpPct}%`;
+    this.hudMpTextEl.textContent = `ЭФ ${stats.mana}/${stats.maxMana}`;
+    this.hudXpBarEl.style.width = `${xpPct}%`;
+    this.hudXpTextEl.textContent = `ОП ${stats.xp}/${stats.xpToNext}`;
 
     if (snap.nearestWaystoneName) {
       this.hudWaystonePromptEl.classList.remove('hidden');
       this.hudWaystonePromptTextEl.textContent = `Обелиск: ${snap.nearestWaystoneName}`;
+      this.promptActionBtnEl.textContent = 'Резонанс [E]';
       this.interactButtonLabelEl.textContent = 'Резонанс';
+    } else if (snap.nearestInteractableName) {
+      this.hudWaystonePromptEl.classList.remove('hidden');
+      this.hudWaystonePromptTextEl.textContent = snap.nearestInteractableName;
+      this.promptActionBtnEl.textContent = `${snap.nearestActionLabel ?? 'Действие'} [E]`;
+      this.interactButtonLabelEl.textContent = snap.nearestActionLabel ?? 'Действие';
     } else {
       this.hudWaystonePromptEl.classList.add('hidden');
       this.interactButtonLabelEl.textContent = 'Запись';
-    }
-
-    if (snap.dashCooldownRatio > 0) {
-      this.dashButtonEl.classList.add('opacity-60');
-      this.dashCooldownLabelEl.textContent = `${(snap.dashCooldownRatio * 1.15).toFixed(1)}с`;
-    } else {
-      this.dashButtonEl.classList.remove('opacity-60');
-      this.dashCooldownLabelEl.textContent = 'Рывок';
     }
   }
 
@@ -873,14 +1171,15 @@ export class GameShellUI {
       minute: '2-digit',
       second: '2-digit',
     });
+    const facingLabel = formatFacingLabel(save.playerPosition.facing);
 
     this.titleSaveSummaryEl.innerHTML = `
       <div class="flex flex-wrap items-center gap-x-3 gap-y-1">
-        <span class="text-amber-300 font-semibold">Слот IndexedDB #1</span>
+        <span class="text-amber-300 font-semibold">Слот IndexedDB #1 (v${save.version})</span>
         <span aria-hidden="true">·</span>
-        <span>Точка: ${wsObj.name}</span>
+        <span>Ур.${save.heroStats.level} (${save.heroStats.xp}/${save.heroStats.xpToNext} ОП)</span>
         <span aria-hidden="true">·</span>
-        <span>X: ${save.playerPosition.x}, Y: ${save.playerPosition.y}</span>
+        <span>X: ${save.playerPosition.x}, Y: ${save.playerPosition.y} (${facingLabel})</span>
         <span aria-hidden="true">·</span>
         <span>Обелиски: ${save.discoveredWaystones.length}/${THRESHOLD_WAYSTONES.length}</span>
       </div>
@@ -892,12 +1191,9 @@ export class GameShellUI {
         <span>FNV-1a: #${save.checksum}</span>
       </div>
       <div>Регион: ${save.regionName} · Активный якорь: ${wsObj.name}</div>
-      <div>Координаты: X=${save.playerPosition.x}, Y=${save.playerPosition.y} · Направление: ${
-        save.playerPosition.facing === 'right' ? 'Восток' : 'Запад'
-      } · Время: ${save.playTimeSeconds}с</div>
-      <div>Открыто путевых обелисков: ${save.discoveredWaystones.length} из ${
-        THRESHOLD_WAYSTONES.length
-      } · Записано в ${formattedTime}</div>
+      <div>Герой: Уровень ${save.heroStats.level} (ОП ${save.heroStats.xp}/${save.heroStats.xpToNext}) · ОЗ ${save.heroStats.hp}/${save.heroStats.maxHp} · ЭФ ${save.heroStats.mana}/${save.heroStats.maxMana}</div>
+      <div>Координаты: X=${save.playerPosition.x}, Y=${save.playerPosition.y} · Направление: ${facingLabel} · Время: ${save.playTimeSeconds}с</div>
+      <div>Обелиски: ${save.discoveredWaystones.length}/${THRESHOLD_WAYSTONES.length} · Изучено объектов мира: ${save.discoveredInteractables.length}/${THRESHOLD_INTERACTABLES.length} · Записано в ${formattedTime}</div>
     `;
   }
 

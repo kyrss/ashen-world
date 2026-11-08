@@ -1,26 +1,41 @@
-import type { GameShellState } from './config';
-import type { SaveRecord, UserSettings } from '../save/SaveManager';
+import type { FacingDirection, GameShellState } from './config';
+import type { HeroStats, SaveRecord, UserSettings } from '../save/SaveManager';
 
 export interface TelemetrySnapshot {
   x: number;
   y: number;
   vx: number;
   vy: number;
-  grounded: boolean;
-  dashing: boolean;
-  dashCooldownRatio: number;
-  facing: 'left' | 'right';
+  moving: boolean;
+  facing: FacingDirection;
+  animationKey: string;
   nearestWaystoneId: string | null;
   nearestWaystoneName: string | null;
-  discoveredCount: number;
+  nearestInteractableId: string | null;
+  nearestInteractableName: string | null;
+  nearestInteractableRole: string | null;
+  nearestActionLabel: string | null;
+  discoveredWaystonesCount: number;
   totalWaystones: number;
+  discoveredInteractablesCount: number;
+  totalInteractables: number;
   zoneTitle: string;
+  heroStats: HeroStats;
+}
+
+export interface WorldDialoguePayload {
+  id: string;
+  speakerName: string;
+  roleTitle: string;
+  lines: string[];
+  xpGranted: number;
 }
 
 export interface AshenEvents {
   'state:changed': GameShellState;
   'telemetry:updated': TelemetrySnapshot;
   'waystone:attuned': { id: string; name: string; save: SaveRecord };
+  'world:interacted': WorldDialoguePayload;
   'save:requested': { source: 'pause_menu' | 'hud_button' };
   'save:completed': SaveRecord;
   'save:failed': { reason: string };
@@ -56,4 +71,3 @@ export class TypedEventBus {
 }
 
 export const eventBus = new TypedEventBus();
-

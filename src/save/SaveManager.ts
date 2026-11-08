@@ -1,18 +1,41 @@
+import { ALL_FACING_DIRECTIONS, type FacingDirection } from '../core/config';
 import {
   clampWorldPosition,
+  DEFAULT_SPAWN_POINT,
   findNearestWaystone,
+  resolveSafeWalkablePosition,
+  THRESHOLD_INTERACTABLES,
   THRESHOLD_WAYSTONES,
   type WaystoneSpec,
 } from '../world/thresholdLayout';
 import { eventBus, type TypedEventBus } from '../core/EventBus';
 
-
-export const SAVE_SCHEMA_VERSION = 1;
+export const SAVE_SCHEMA_VERSION = 2;
 export const SAVE_DB_NAME = 'ashen_world_db';
 export const SAVE_STORE_NAME = 'saves';
 export const DEFAULT_SLOT_ID = 'slot_1';
 export const SETTINGS_STORAGE_KEY = 'ashen_world_settings_v1';
 export const FALLBACK_SAVE_STORAGE_KEY = 'ashen_world_save_backup_v1';
+
+export interface HeroStats {
+  level: number;
+  xp: number;
+  xpToNext: number;
+  hp: number;
+  maxHp: number;
+  mana: number;
+  maxMana: number;
+}
+
+export const DEFAULT_HERO_STATS: HeroStats = {
+  level: 1,
+  xp: 0,
+  xpToNext: 100,
+  hp: 120,
+  maxHp: 120,
+  mana: 80,
+  maxMana: 80,
+};
 
 export interface SaveRecord {
   version: number;
@@ -23,10 +46,12 @@ export interface SaveRecord {
   playerPosition: {
     x: number;
     y: number;
-    facing: 'left' | 'right';
+    facing: FacingDirection;
   };
   activeWaystoneId: string;
   discoveredWaystones: string[];
+  discoveredInteractables: string[];
+  heroStats: HeroStats;
   playTimeSeconds: number;
   checksum: string; // 32-bit FNV-1a hex digest
 }
@@ -34,9 +59,12 @@ export interface SaveRecord {
 export interface SavePartialUpdate {
   x?: number;
   y?: number;
-  facing?: 'left' | 'right';
+  facing?: FacingDirection | 'left' | 'right';
   activeWaystoneId?: string;
   discoveredWaystoneId?: string;
+  discoveredInteractableId?: string;
+  xpGain?: number;
+  restoreVitals?: boolean;
   playTimeSeconds?: number;
 }
 
@@ -61,11 +89,74 @@ export const DEFAULT_USER_SETTINGS: UserSettings = {
   hapticFeedback: true,
 };
 
+const VALID_FACING_SET = new Set<string>(ALL_FACING_DIRECTIONS);
+
+export function normalizeFacingDirection(raw: unknown): FacingDirection {
+  if (raw === 'left') return 'w';
+  if (raw === 'right') return 'e';
+  if (typeof raw === 'string' && VALID_FACING_SET.has(raw)) {
+    return raw as FacingDirection;
+  }
+  return 's';
+}
+
 /**
- * Computes a deterministic 32-bit FNV-1a hex checksum over the core save fields
- * to guard against corrupted or truncated local saves.
+ * Pure helper to apply experience points and level-ups to HeroStats.
  */
-export function computeSaveChecksum(payload: Omit<SaveRecord, 'checksum'>): string {
+export function applyExperienceGain(stats: HeroStats, xpDelta: number): HeroStats {
+  if (xpDelta <= 0) {
+    return { ...stats };
+  }
+  let level = stats.level;
+  let xp = stats.xp + Math.floor(xpDelta);
+  let xpToNext = stats.xpToNext;
+  let maxHp = stats.maxHp;
+  let maxMana = stats.maxMana;
+  let hp = stats.hp;
+  let mana = stats.mana;
+
+  while (xp >= xpToNext) {
+    xp -= xpToNext;
+    level += 1;
+    xpToNext = Math.round(xpToNext * 1.35);
+    maxHp += 20;
+    maxMana += 15;
+    hp = maxHp;
+    mana = maxMana;
+  }
+
+  return {
+    level,
+    xp,
+    xpToNext,
+    hp,
+    maxHp,
+    mana,
+    maxMana,
+  };
+}
+
+function fnv1aHex(canonical: string): string {
+  let hash = 0x811c9dc5;
+  for (let i = 0; i < canonical.length; i++) {
+    hash ^= canonical.charCodeAt(i);
+    hash = Math.imul(hash, 0x01000193);
+  }
+  return (hash >>> 0).toString(16).padStart(8, '0');
+}
+
+/**
+ * Legacy v1 checksum computation (kept so v1 saves can be verified before migration to v2).
+ */
+export function computeLegacyV1Checksum(payload: {
+  version: number;
+  slotId: string;
+  regionId: string;
+  playerPosition: { x: number; y: number; facing: string };
+  activeWaystoneId: string;
+  discoveredWaystones: string[];
+  playTimeSeconds: number;
+}): string {
   const canonical = JSON.stringify({
     v: payload.version,
     slot: payload.slotId,
@@ -77,18 +168,35 @@ export function computeSaveChecksum(payload: Omit<SaveRecord, 'checksum'>): stri
     disc: [...payload.discoveredWaystones].sort(),
     t: Math.floor(payload.playTimeSeconds),
   });
+  return fnv1aHex(canonical);
+}
 
-  let hash = 0x811c9dc5;
-  for (let i = 0; i < canonical.length; i++) {
-    hash ^= canonical.charCodeAt(i);
-    hash = Math.imul(hash, 0x01000193);
-  }
-  return (hash >>> 0).toString(16).padStart(8, '0');
+/**
+ * Computes a deterministic 32-bit FNV-1a hex checksum over the v2 RPG save payload.
+ */
+export function computeSaveChecksum(payload: Omit<SaveRecord, 'checksum'>): string {
+  const canonical = JSON.stringify({
+    v: payload.version,
+    slot: payload.slotId,
+    region: payload.regionId,
+    x: Math.round(payload.playerPosition.x),
+    y: Math.round(payload.playerPosition.y),
+    facing: payload.playerPosition.facing,
+    ws: payload.activeWaystoneId,
+    disc: [...payload.discoveredWaystones].sort(),
+    inter: [...(payload.discoveredInteractables ?? [])].sort(),
+    lvl: payload.heroStats?.level ?? 1,
+    xp: payload.heroStats?.xp ?? 0,
+    hp: payload.heroStats?.hp ?? 120,
+    mp: payload.heroStats?.mana ?? 80,
+    t: Math.floor(payload.playTimeSeconds),
+  });
+  return fnv1aHex(canonical);
 }
 
 export function createInitialSaveRecord(slotId: string = DEFAULT_SLOT_ID): SaveRecord {
   const startWaystone = THRESHOLD_WAYSTONES[0];
-  const clamped = clampWorldPosition(startWaystone.x, startWaystone.y - 40);
+  const spawn = resolveSafeWalkablePosition(DEFAULT_SPAWN_POINT.x, DEFAULT_SPAWN_POINT.y);
   const base: Omit<SaveRecord, 'checksum'> = {
     version: SAVE_SCHEMA_VERSION,
     slotId,
@@ -96,12 +204,14 @@ export function createInitialSaveRecord(slotId: string = DEFAULT_SLOT_ID): SaveR
     regionId: 'ashen_threshold',
     regionName: 'Пепельный Рубеж',
     playerPosition: {
-      x: clamped.x,
-      y: clamped.y,
-      facing: 'right',
+      x: spawn.x,
+      y: spawn.y,
+      facing: 'e',
     },
     activeWaystoneId: startWaystone.id,
     discoveredWaystones: [startWaystone.id],
+    discoveredInteractables: [],
+    heroStats: { ...DEFAULT_HERO_STATS },
     playTimeSeconds: 0,
   };
 
@@ -113,18 +223,20 @@ export function createInitialSaveRecord(slotId: string = DEFAULT_SLOT_ID): SaveR
 
 /**
  * Strictly validates a raw save object loaded from IndexedDB or LocalStorage backup.
- * 1. Verifies structural fields and schema version (1..SAVE_SCHEMA_VERSION).
- * 2. For current-version records, verifies that the stored FNV-1a checksum matches the raw payload.
- *    If the checksum does not match, returns null so corrupted data is rejected.
- * 3. For legacy schema versions (< SAVE_SCHEMA_VERSION), migrates fields and computes a new v1 checksum.
- * 4. Clamps out-of-bounds world coordinates and returns a sanitized SaveRecord.
+ * - Supports both schema v1 (Stage 1 platformer saves) and schema v2 (Stage 2 2D RPG saves).
+ * - Strictly verifies the FNV-1a checksum for both v1 and v2 records; rejects tampered/corrupted records (`null`).
+ * - Safely migrates valid v1 records to v2 (converting 'left'/'right' to 'w'/'e', resolving safe walkable 2D coordinates,
+ *   and initializing heroStats and discoveredInteractables).
  */
 export function validateAndMigrateSave(raw: unknown): SaveRecord | null {
   if (!raw || typeof raw !== 'object') {
     return null;
   }
 
-  const candidate = raw as Partial<SaveRecord>;
+  const candidate = raw as Partial<SaveRecord> & {
+    playerPosition?: { x?: unknown; y?: unknown; facing?: unknown };
+  };
+
   if (
     typeof candidate.version !== 'number' ||
     candidate.version < 1 ||
@@ -155,12 +267,16 @@ export function validateAndMigrateSave(raw: unknown): SaveRecord | null {
     return null;
   }
 
-  const validWaystoneIds = new Set(THRESHOLD_WAYSTONES.map((w) => w.id));
   if (!Array.isArray(candidate.discoveredWaystones)) {
     return null;
   }
 
-  const rawFacing = candidate.playerPosition.facing === 'left' ? 'left' : 'right';
+  if (typeof candidate.checksum !== 'string' || candidate.checksum.length !== 8) {
+    return null;
+  }
+
+  const validWaystoneIds = new Set(THRESHOLD_WAYSTONES.map((w) => w.id));
+  const validInteractableIds = new Set(THRESHOLD_INTERACTABLES.map((i) => i.id));
   const rawActiveWs =
     typeof candidate.activeWaystoneId === 'string'
       ? candidate.activeWaystoneId
@@ -168,37 +284,99 @@ export function validateAndMigrateSave(raw: unknown): SaveRecord | null {
   const rawRegionId =
     typeof candidate.regionId === 'string' ? candidate.regionId : 'ashen_threshold';
 
-  // Strict FNV-1a integrity verification for current schema version
-  if (candidate.version === SAVE_SCHEMA_VERSION) {
-    if (typeof candidate.checksum !== 'string' || candidate.checksum.length !== 8) {
-      return null;
-    }
-
-    const rawCanonicalPayload: Omit<SaveRecord, 'checksum'> = {
-      version: candidate.version,
+  // 1. Verify integrity of v1 legacy saves before migrating to v2
+  if (candidate.version === 1) {
+    const rawFacing: unknown = candidate.playerPosition.facing;
+    const legacyFacing = rawFacing === 'left' ? 'left' : 'right';
+    const expectedV1Hash = computeLegacyV1Checksum({
+      version: 1,
       slotId: candidate.slotId,
-      savedAt: typeof candidate.savedAt === 'string' ? candidate.savedAt : '',
       regionId: rawRegionId,
-      regionName: typeof candidate.regionName === 'string' ? candidate.regionName : 'Пепельный Рубеж',
       playerPosition: {
         x: candidate.playerPosition.x,
         y: candidate.playerPosition.y,
-        facing: rawFacing,
+        facing: legacyFacing,
       },
       activeWaystoneId: rawActiveWs,
       discoveredWaystones: candidate.discoveredWaystones.filter(
         (id): id is string => typeof id === 'string'
       ),
       playTimeSeconds: candidate.playTimeSeconds,
-    };
+    });
 
-    const computedRawHash = computeSaveChecksum(rawCanonicalPayload);
-    if (computedRawHash !== candidate.checksum) {
+    if (expectedV1Hash !== candidate.checksum) {
       return null;
     }
   }
 
-  // Sanitize discovered waystones and clamp world position into safe bounds
+  // 2. Verify integrity of v2 saves
+  const normalizedFacing = normalizeFacingDirection(candidate.playerPosition.facing);
+  const rawInteractables = Array.isArray(candidate.discoveredInteractables)
+    ? candidate.discoveredInteractables.filter((id): id is string => typeof id === 'string')
+    : [];
+  const rawHeroStats: HeroStats =
+    candidate.heroStats && typeof candidate.heroStats === 'object'
+      ? {
+          level:
+            typeof candidate.heroStats.level === 'number'
+              ? Math.max(1, Math.floor(candidate.heroStats.level))
+              : DEFAULT_HERO_STATS.level,
+          xp:
+            typeof candidate.heroStats.xp === 'number'
+              ? Math.max(0, Math.floor(candidate.heroStats.xp))
+              : DEFAULT_HERO_STATS.xp,
+          xpToNext:
+            typeof candidate.heroStats.xpToNext === 'number'
+              ? Math.max(50, Math.floor(candidate.heroStats.xpToNext))
+              : DEFAULT_HERO_STATS.xpToNext,
+          hp:
+            typeof candidate.heroStats.hp === 'number'
+              ? Math.max(1, Math.floor(candidate.heroStats.hp))
+              : DEFAULT_HERO_STATS.hp,
+          maxHp:
+            typeof candidate.heroStats.maxHp === 'number'
+              ? Math.max(50, Math.floor(candidate.heroStats.maxHp))
+              : DEFAULT_HERO_STATS.maxHp,
+          mana:
+            typeof candidate.heroStats.mana === 'number'
+              ? Math.max(0, Math.floor(candidate.heroStats.mana))
+              : DEFAULT_HERO_STATS.mana,
+          maxMana:
+            typeof candidate.heroStats.maxMana === 'number'
+              ? Math.max(20, Math.floor(candidate.heroStats.maxMana))
+              : DEFAULT_HERO_STATS.maxMana,
+        }
+      : { ...DEFAULT_HERO_STATS };
+
+  if (candidate.version === SAVE_SCHEMA_VERSION) {
+    const rawV2Payload: Omit<SaveRecord, 'checksum'> = {
+      version: candidate.version,
+      slotId: candidate.slotId,
+      savedAt: typeof candidate.savedAt === 'string' ? candidate.savedAt : '',
+      regionId: rawRegionId,
+      regionName:
+        typeof candidate.regionName === 'string' ? candidate.regionName : 'Пепельный Рубеж',
+      playerPosition: {
+        x: candidate.playerPosition.x,
+        y: candidate.playerPosition.y,
+        facing: normalizedFacing,
+      },
+      activeWaystoneId: rawActiveWs,
+      discoveredWaystones: candidate.discoveredWaystones.filter(
+        (id): id is string => typeof id === 'string'
+      ),
+      discoveredInteractables: rawInteractables,
+      heroStats: rawHeroStats,
+      playTimeSeconds: candidate.playTimeSeconds,
+    };
+
+    const computedV2Hash = computeSaveChecksum(rawV2Payload);
+    if (computedV2Hash !== candidate.checksum) {
+      return null;
+    }
+  }
+
+  // 3. Sanitize and migrate to v2
   const filteredDiscovered = candidate.discoveredWaystones.filter(
     (id): id is string => typeof id === 'string' && validWaystoneIds.has(id)
   );
@@ -211,7 +389,28 @@ export function validateAndMigrateSave(raw: unknown): SaveRecord | null {
     ? rawActiveWs
     : discoveredWaystones[0];
 
-  const clampedPos = clampWorldPosition(candidate.playerPosition.x, candidate.playerPosition.y);
+  const discoveredInteractables = Array.from(
+    new Set(rawInteractables.filter((id) => validInteractableIds.has(id)))
+  );
+
+  // If migrating from v1 default spawn (340, 700), map to the v2 West Gate spawn road;
+  // otherwise clamp into world bounds (and resolve safe walkable if v1).
+  let targetX = candidate.playerPosition.x;
+  let targetY = candidate.playerPosition.y;
+  if (candidate.version === 1) {
+    if (Math.abs(targetX - 340) <= 10 && Math.abs(targetY - 700) <= 10) {
+      targetX = DEFAULT_SPAWN_POINT.x;
+      targetY = DEFAULT_SPAWN_POINT.y;
+    }
+    const safePos = resolveSafeWalkablePosition(targetX, targetY);
+    targetX = safePos.x;
+    targetY = safePos.y;
+  } else {
+    const clampedPos = clampWorldPosition(targetX, targetY);
+    targetX = clampedPos.x;
+    targetY = clampedPos.y;
+  }
+
   const parsedTime =
     typeof candidate.savedAt === 'string' && Number.isFinite(Date.parse(candidate.savedAt))
       ? candidate.savedAt
@@ -224,12 +423,14 @@ export function validateAndMigrateSave(raw: unknown): SaveRecord | null {
     regionId: 'ashen_threshold',
     regionName: 'Пепельный Рубеж',
     playerPosition: {
-      x: clampedPos.x,
-      y: clampedPos.y,
-      facing: rawFacing,
+      x: targetX,
+      y: targetY,
+      facing: normalizedFacing,
     },
     activeWaystoneId,
     discoveredWaystones,
+    discoveredInteractables,
+    heroStats: rawHeroStats,
     playTimeSeconds: Math.max(0, Math.floor(candidate.playTimeSeconds)),
   };
 
@@ -241,15 +442,6 @@ export function validateAndMigrateSave(raw: unknown): SaveRecord | null {
 
 /**
  * Unified comparator for determining which of two valid SaveRecords is newer.
- * Returns:
- *  > 0 if record `a` is strictly newer than `b`
- *  < 0 if record `b` is strictly newer than `a`
- *    0 if both records have identical timestamps, playTimeSeconds, and discovered progress
- *
- * Rules:
- * 1. Newer `savedAt` ISO timestamp wins (even if `playTimeSeconds` is identical, e.g., saving while paused).
- * 2. If `savedAt` timestamps are equal, greater `playTimeSeconds` wins.
- * 3. If both `savedAt` and `playTimeSeconds` are equal, more `discoveredWaystones` wins.
  */
 export function compareSaveFreshness(a: SaveRecord, b: SaveRecord): number {
   const timeA = Date.parse(a.savedAt) || 0;
@@ -266,17 +458,15 @@ export function compareSaveFreshness(a: SaveRecord, b: SaveRecord): number {
     return a.discoveredWaystones.length - b.discoveredWaystones.length;
   }
 
+  if (a.discoveredInteractables.length !== b.discoveredInteractables.length) {
+    return a.discoveredInteractables.length - b.discoveredInteractables.length;
+  }
+
   return 0;
 }
 
 /**
- * Reconciles primary IndexedDB record and LocalStorage backup record using unified freshness rules:
- * - Never allows a corrupted record to overwrite a healthy backup.
- * - If both records are valid, uses `compareSaveFreshness` so a newer backup with identical playTimeSeconds
- *   still wins over an older IndexedDB record.
- * - If both records have identical timestamps and playTimeSeconds:
- *   - If their checksums match, no sync is required.
- *   - If their contents differ (conflict at identical timestamp), primary IndexedDB wins and syncs backup.
+ * Reconciles primary IndexedDB record and LocalStorage backup record using unified freshness rules.
  */
 export function reconcileSaveRecords(
   idbRaw: unknown,
@@ -289,7 +479,7 @@ export function reconcileSaveRecords(
     return {
       winner: validIdb,
       source: 'idb',
-      needsSyncToIdb: false,
+      needsSyncToIdb: (idbRaw as { version?: number })?.version !== SAVE_SCHEMA_VERSION,
       needsSyncToBackup: true,
     };
   }
@@ -299,7 +489,7 @@ export function reconcileSaveRecords(
       winner: validBackup,
       source: 'backup',
       needsSyncToIdb: true,
-      needsSyncToBackup: false,
+      needsSyncToBackup: (backupRaw as { version?: number })?.version !== SAVE_SCHEMA_VERSION,
     };
   }
 
@@ -318,7 +508,6 @@ export function reconcileSaveRecords(
   const cmp = compareSaveFreshness(backupRecord, idbRecord);
 
   if (cmp > 0) {
-    // Backup is strictly newer than IndexedDB (even if playTimeSeconds is equal)
     return {
       winner: backupRecord,
       source: 'backup',
@@ -328,7 +517,6 @@ export function reconcileSaveRecords(
   }
 
   if (cmp < 0) {
-    // IndexedDB is strictly newer than Backup
     return {
       winner: idbRecord,
       source: 'idb',
@@ -337,17 +525,17 @@ export function reconcileSaveRecords(
     };
   }
 
-  // cmp === 0: identical timestamp, playTimeSeconds, and discovered count
   if (idbRecord.checksum === backupRecord.checksum) {
+    const idbWasLegacy = (idbRaw as { version?: number })?.version !== SAVE_SCHEMA_VERSION;
+    const backupWasLegacy = (backupRaw as { version?: number })?.version !== SAVE_SCHEMA_VERSION;
     return {
       winner: idbRecord,
       source: 'idb',
-      needsSyncToIdb: false,
-      needsSyncToBackup: false,
+      needsSyncToIdb: idbWasLegacy,
+      needsSyncToBackup: backupWasLegacy,
     };
   }
 
-  // Tie with conflicting content: primary IndexedDB wins and syncs backup for consistency
   return {
     winner: idbRecord,
     source: 'idb',
@@ -369,7 +557,7 @@ export interface SaveStorageAdapter {
 export interface LivePlayerStateSnapshot {
   x: number;
   y: number;
-  facing: 'left' | 'right';
+  facing: FacingDirection | 'left' | 'right';
   playTimeSeconds: number;
 }
 
@@ -385,10 +573,6 @@ export class SaveManager {
     this.adapter = adapter;
   }
 
-  /**
-   * Enqueues async storage operations in strict FIFO order so concurrent calls to
-   * saveGame / loadSave / resetSave never race or overwrite newer saves with stale writes.
-   */
   private enqueue<T>(task: () => Promise<T>): Promise<T> {
     const next = this.operationQueue.then(task, task);
     this.operationQueue = next.then(
@@ -420,6 +604,8 @@ export class SaveManager {
       ...this.currentSave,
       playerPosition: { ...this.currentSave.playerPosition },
       discoveredWaystones: [...this.currentSave.discoveredWaystones],
+      discoveredInteractables: [...this.currentSave.discoveredInteractables],
+      heroStats: { ...this.currentSave.heroStats },
     };
   }
 
@@ -485,7 +671,9 @@ export class SaveManager {
 
     this.dbPromise = new Promise((resolve) => {
       try {
-        const request = window.indexedDB.open(SAVE_DB_NAME, SAVE_SCHEMA_VERSION);
+        // Keep IDB container version at 1 so existing stores open without schema upgrade conflicts;
+        // record-level version (SAVE_SCHEMA_VERSION = 2) handles document migration.
+        const request = window.indexedDB.open(SAVE_DB_NAME, 1);
         request.onupgradeneeded = () => {
           const db = request.result;
           if (!db.objectStoreNames.contains(SAVE_STORE_NAME)) {
@@ -613,7 +801,6 @@ export class SaveManager {
 
   async saveGame(partialUpdate?: SavePartialUpdate): Promise<SaveRecord> {
     return this.enqueue(async () => {
-      // Reconcile both stores and in-memory state using the unified freshness comparator
       const idbRaw = await this.readFromIdb(this.currentSave.slotId || DEFAULT_SLOT_ID);
       const backupRaw = this.readFromBackup();
       const storedReconciled = reconcileSaveRecords(idbRaw, backupRaw);
@@ -633,17 +820,35 @@ export class SaveManager {
         discoveredSet.add(partialUpdate.discoveredWaystoneId);
       }
 
+      const interactablesSet = new Set(prev.discoveredInteractables);
+      if (partialUpdate?.discoveredInteractableId) {
+        interactablesSet.add(partialUpdate.discoveredInteractableId);
+      }
+
+      let nextHeroStats = { ...prev.heroStats };
+      if (partialUpdate?.xpGain && partialUpdate.xpGain > 0) {
+        nextHeroStats = applyExperienceGain(nextHeroStats, partialUpdate.xpGain);
+      }
+      if (partialUpdate?.restoreVitals) {
+        nextHeroStats.hp = nextHeroStats.maxHp;
+        nextHeroStats.mana = nextHeroStats.maxMana;
+      }
+
       const rawX = partialUpdate?.x ?? prev.playerPosition.x;
       const rawY = partialUpdate?.y ?? prev.playerPosition.y;
       const clamped = clampWorldPosition(rawX, rawY);
 
-      // Guarantee monotonically increasing timestamp so sequential saves within the same millisecond are strictly ordered
       const prevTimestampMs = Date.parse(prev.savedAt) || 0;
       const nextTimestampMs = Math.max(Date.now(), prevTimestampMs + 1);
       const nextPlayTime =
         partialUpdate?.playTimeSeconds !== undefined
           ? Math.max(prev.playTimeSeconds, Math.floor(partialUpdate.playTimeSeconds))
           : prev.playTimeSeconds;
+
+      const nextFacing =
+        partialUpdate?.facing !== undefined
+          ? normalizeFacingDirection(partialUpdate.facing)
+          : prev.playerPosition.facing;
 
       const nextWithoutChecksum: Omit<SaveRecord, 'checksum'> = {
         version: SAVE_SCHEMA_VERSION,
@@ -654,10 +859,12 @@ export class SaveManager {
         playerPosition: {
           x: clamped.x,
           y: clamped.y,
-          facing: partialUpdate?.facing ?? prev.playerPosition.facing,
+          facing: nextFacing,
         },
         activeWaystoneId: partialUpdate?.activeWaystoneId ?? prev.activeWaystoneId,
         discoveredWaystones: Array.from(discoveredSet),
+        discoveredInteractables: Array.from(interactablesSet),
+        heroStats: nextHeroStats,
         playTimeSeconds: nextPlayTime,
       };
 
@@ -667,7 +874,11 @@ export class SaveManager {
       };
 
       const writeRes = await this.writeToStores(nextRecord, true, true);
-      if ((typeof window !== 'undefined' || this.adapter) && !writeRes.idbWritten && !writeRes.backupWritten) {
+      if (
+        (typeof window !== 'undefined' || this.adapter) &&
+        !writeRes.idbWritten &&
+        !writeRes.backupWritten
+      ) {
         throw new Error('Не удалось записать сохранение ни в IndexedDB, ни в резервное хранилище');
       }
 
@@ -680,7 +891,11 @@ export class SaveManager {
     return this.enqueue(async () => {
       const fresh = createInitialSaveRecord(slotId);
       const writeRes = await this.writeToStores(fresh, true, true);
-      if ((typeof window !== 'undefined' || this.adapter) && !writeRes.idbWritten && !writeRes.backupWritten) {
+      if (
+        (typeof window !== 'undefined' || this.adapter) &&
+        !writeRes.idbWritten &&
+        !writeRes.backupWritten
+      ) {
         throw new Error('Не удалось сбросить сохранение в хранилище');
       }
       this.currentSave = fresh;
@@ -730,6 +945,7 @@ export function bindLiveSceneSaveHandler(options: {
           ? {
               activeWaystoneId: nearest.id,
               discoveredWaystoneId: nearest.id,
+              restoreVitals: true,
             }
           : {}),
       })

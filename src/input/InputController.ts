@@ -1,3 +1,5 @@
+import { normalizeMovementVector } from '../core/config';
+
 export interface JoystickVector {
   x: number; // -1..1
   y: number; // -1..1
@@ -8,17 +10,16 @@ export interface JoystickVector {
 }
 
 export interface InputSnapshot {
-  moveX: number; // -1..1
-  moveY: number; // -1..1
-  jumpHeld: boolean;
-  jumpJustPressed: boolean;
-  dashJustPressed: boolean;
+  moveX: number; // normalized -1..1
+  moveY: number; // normalized -1..1
+  magnitude: number; // 0..1
   interactJustPressed: boolean;
   pauseJustPressed: boolean;
 }
 
 /**
- * Pure function that computes normalized joystick output with deadzone and sensitivity scaling.
+ * Pure function that computes normalized 360-degree / 8-direction joystick output
+ * with deadzone and sensitivity scaling.
  */
 export function computeJoystickVector(
   deltaX: number,
@@ -49,7 +50,8 @@ export function computeJoystickVector(
     };
   }
 
-  const rescaled = ((rawNorm - deadzone) / (1 - deadzone)) * Math.max(0.7, Math.min(1.4, sensitivity));
+  const rescaled =
+    ((rawNorm - deadzone) / (1 - deadzone)) * Math.max(0.7, Math.min(1.4, sensitivity));
   const finalMag = Math.min(1, rescaled);
 
   return {
@@ -75,9 +77,6 @@ class InputController {
     active: false,
   };
 
-  private touchJumpHeld = false;
-  private touchJumpEdge = false;
-  private touchDashEdge = false;
   private touchInteractEdge = false;
   private touchPauseEdge = false;
   private initialized = false;
@@ -87,7 +86,6 @@ class InputController {
     this.initialized = true;
 
     window.addEventListener('keydown', (e) => {
-      // Ignore keyboard shortcuts if typing in an input
       const tag = (e.target as HTMLElement | null)?.tagName;
       if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
 
@@ -125,9 +123,6 @@ class InputController {
       knobOffsetY: 0,
       active: false,
     };
-    this.touchJumpHeld = false;
-    this.touchJumpEdge = false;
-    this.touchDashEdge = false;
     this.touchInteractEdge = false;
     this.touchPauseEdge = false;
   }
@@ -140,17 +135,6 @@ class InputController {
     return this.touchVector;
   }
 
-  triggerTouchJump(pressed: boolean): void {
-    if (pressed && !this.touchJumpHeld) {
-      this.touchJumpEdge = true;
-    }
-    this.touchJumpHeld = pressed;
-  }
-
-  triggerTouchDash(): void {
-    this.touchDashEdge = true;
-  }
-
   triggerTouchInteract(): void {
     this.touchInteractEdge = true;
   }
@@ -160,7 +144,22 @@ class InputController {
   }
 
   /**
-   * Consumes one-shot edges for the current simulation step and returns unified touch + keyboard state.
+   * Simulates key state in headless tests or programmatic checks.
+   */
+  setKeyDownState(code: string, isDown: boolean): void {
+    if (isDown) {
+      if (!this.keysDown.has(code)) {
+        this.keysJustPressed.add(code);
+      }
+      this.keysDown.add(code);
+    } else {
+      this.keysDown.delete(code);
+    }
+  }
+
+  /**
+   * Consumes one-shot edges for the current simulation step and returns unified,
+   * diagonally normalized touch + keyboard movement vectors.
    */
   consumeFrameInput(): InputSnapshot {
     let kbX = 0;
@@ -171,41 +170,30 @@ class InputController {
     if (this.keysDown.has('KeyW') || this.keysDown.has('ArrowUp')) kbY -= 1;
     if (this.keysDown.has('KeyS') || this.keysDown.has('ArrowDown')) kbY += 1;
 
-    const moveX = Math.abs(this.touchVector.x) > 0.01 ? this.touchVector.x : kbX;
-    const moveY = Math.abs(this.touchVector.y) > 0.01 ? this.touchVector.y : kbY;
+    const useTouch = this.touchVector.active && this.touchVector.magnitude > 0.01;
+    const rawX = useTouch ? this.touchVector.x : kbX;
+    const rawY = useTouch ? this.touchVector.y : kbY;
 
-    const kbJumpHeld =
-      this.keysDown.has('Space') || this.keysDown.has('KeyW') || this.keysDown.has('ArrowUp');
-    const kbJumpJust =
-      this.keysJustPressed.has('Space') ||
-      this.keysJustPressed.has('KeyW') ||
-      this.keysJustPressed.has('ArrowUp');
-
-    const kbDashJust =
-      this.keysJustPressed.has('ShiftLeft') ||
-      this.keysJustPressed.has('ShiftRight') ||
-      this.keysJustPressed.has('KeyK');
+    const normalized = normalizeMovementVector(rawX, rawY);
 
     const kbInteractJust =
-      this.keysJustPressed.has('KeyE') || this.keysJustPressed.has('KeyF');
+      this.keysJustPressed.has('KeyE') ||
+      this.keysJustPressed.has('KeyF') ||
+      this.keysJustPressed.has('Space');
 
     const kbPauseJust =
       this.keysJustPressed.has('Escape') || this.keysJustPressed.has('KeyP');
 
     const snapshot: InputSnapshot = {
-      moveX,
-      moveY,
-      jumpHeld: this.touchJumpHeld || kbJumpHeld,
-      jumpJustPressed: this.touchJumpEdge || kbJumpJust,
-      dashJustPressed: this.touchDashEdge || kbDashJust,
+      moveX: normalized.vx,
+      moveY: normalized.vy,
+      magnitude: normalized.magnitude,
       interactJustPressed: this.touchInteractEdge || kbInteractJust,
       pauseJustPressed: this.touchPauseEdge || kbPauseJust,
     };
 
     // Clear one-shot edge triggers
     this.keysJustPressed.clear();
-    this.touchJumpEdge = false;
-    this.touchDashEdge = false;
     this.touchInteractEdge = false;
     this.touchPauseEdge = false;
 

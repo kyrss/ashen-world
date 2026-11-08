@@ -1,17 +1,26 @@
 import Phaser from 'phaser';
-import { GAME_CONFIG, type GameShellState } from '../core/config';
+import {
+  computeYSortDepth,
+  GAME_CONFIG,
+  resolveFacingDirection,
+  type FacingDirection,
+  type GameShellState,
+} from '../core/config';
 import { eventBus } from '../core/EventBus';
-import { ASSET_KEYS } from '../gfx/AssetManifest';
+import { ASSET_KEYS, getHeroAnimKey } from '../gfx/AssetManifest';
 import { inputController } from '../input/InputController';
 import { bindLiveSceneSaveHandler, saveManager } from '../save/SaveManager';
 import { soundFX } from '../audio/SoundFX';
 import {
-  THRESHOLD_PLATFORMS,
-  THRESHOLD_PROPS,
-  THRESHOLD_WAYSTONES,
+  findNearestInteractable,
   findNearestWaystone,
   resolveZoneTitle,
+  THRESHOLD_INTERACTABLES,
+  THRESHOLD_PROPS,
+  THRESHOLD_ROADS,
+  THRESHOLD_WAYSTONES,
   type WaystoneSpec,
+  type WorldInteractableSpec,
 } from '../world/thresholdLayout';
 
 interface AshMote {
@@ -31,30 +40,27 @@ interface DustParticle {
 
 export class ThresholdScene extends Phaser.Scene {
   private shellState: GameShellState = 'title';
-  private platformsGroup!: Phaser.Physics.Arcade.StaticGroup;
+  private obstaclesGroup!: Phaser.Physics.Arcade.StaticGroup;
   private seeker!: Phaser.Types.Physics.Arcade.SpriteWithDynamicBody;
-  private waystoneSprites = new Map<string, Phaser.GameObjects.Image>();
-  private waystoneRings = new Map<string, Phaser.GameObjects.Arc>();
+  private turfTile!: Phaser.GameObjects.TileSprite;
 
-  private facing: 'left' | 'right' = 'right';
-  private lastGroundedTime = 0;
-  private lastJumpPressedTime = -9999;
-  private wasGrounded = false;
-  private isDashing = false;
-  private dashEndTime = 0;
-  private dashCooldownUntil = 0;
+  private waystoneSprites = new Map<string, Phaser.GameObjects.Image>();
+  private waystoneRings = new Map<string, Phaser.GameObjects.Ellipse>();
+  private interactableSprites = new Map<string, Phaser.GameObjects.Image>();
+  private interactableRings = new Map<string, Phaser.GameObjects.Ellipse>();
+
+  private facing: FacingDirection = 'e';
+  private currentAnimKey = 'hero-idle-e';
   private walkDistanceAccumulator = 0;
   private stepSoundAccumulator = 0;
-
-  private scaleSquashX = 1;
-  private scaleSquashY = 1;
 
   private ashPool: AshMote[] = [];
   private dustPool: DustParticle[] = [];
   private tourAngle = 0;
   private sessionPlayTimeSec = 0;
   private autosaveTimerSec = 0;
-  private discoveredWaystonesCount = 1;
+  private discoveredWaystones = new Set<string>();
+  private discoveredInteractables = new Set<string>();
   private lastTelemetryHash = '';
 
   private unsubscribeState?: () => void;
@@ -66,45 +72,53 @@ export class ThresholdScene extends Phaser.Scene {
   }
 
   create(): void {
-    // Reset pools and maps so scene restarts never retain stale references
     this.ashPool = [];
     this.dustPool = [];
     this.waystoneSprites.clear();
     this.waystoneRings.clear();
+    this.interactableSprites.clear();
+    this.interactableRings.clear();
     this.lastTelemetryHash = '';
 
     const save = saveManager.getCurrentSave();
     this.sessionPlayTimeSec = save.playTimeSeconds;
     this.facing = save.playerPosition.facing;
-    this.discoveredWaystonesCount = save.discoveredWaystones.length;
+    this.discoveredWaystones = new Set(save.discoveredWaystones);
+    this.discoveredInteractables = new Set(save.discoveredInteractables);
 
-    // 1. Configure physics world bounds & anti-tunneling bias
-    this.physics.world.setBounds(0, 0, GAME_CONFIG.WORLD_WIDTH, GAME_CONFIG.WORLD_HEIGHT);
-    this.physics.world.TILE_BIAS = 32;
-    this.physics.world.OVERLAP_BIAS = 16;
+    // 1. Configure 2D top-down RPG world bounds (zero gravity)
+    this.physics.world.gravity.set(0, 0);
+    this.physics.world.setBounds(
+      GAME_CONFIG.WORLD_MARGIN,
+      GAME_CONFIG.WORLD_MARGIN + 60,
+      GAME_CONFIG.WORLD_WIDTH - GAME_CONFIG.WORLD_MARGIN * 2,
+      GAME_CONFIG.WORLD_HEIGHT - GAME_CONFIG.WORLD_MARGIN * 2 - 60
+    );
 
     this.cameras.main.setBounds(0, 0, GAME_CONFIG.WORLD_WIDTH, GAME_CONFIG.WORLD_HEIGHT);
-    this.cameras.main.setBackgroundColor('#090b10');
+    this.cameras.main.setBackgroundColor('#0c1018');
 
-    // 2. Build multi-layer atmospheric parallax backdrop
-    this.createParallaxBackdrop();
+    this.obstaclesGroup = this.physics.add.staticGroup();
 
-    // 3. Create background architectural props (arches, pillars, braziers, rift fissures)
-    this.createRuinProps();
+    // 2. Build 2D RPG terrain, roads, sanctuary mosaic plazas & perimeter walls
+    this.createTerrainAndRoads();
 
-    // 4. Create static collision platforms & carved stone borders
-    this.createPlatforms();
+    // 3. Create Y-sorted world architecture, trees, boulders & braziers
+    this.createWorldProps();
 
-    // 5. Create interactive Waystone Obelisks
-    this.createWaystones(save.discoveredWaystones);
+    // 4. Create interactive Waystone Obelisks
+    this.createWaystones();
 
-    // 6. Create Stage 1 Pioneer Seeker prototype avatar
-    this.createSeeker(save.playerPosition.x, save.playerPosition.y);
+    // 5. Create NPCs, Lore Shrines, Reliquary Chest & Campfire
+    this.createInteractables();
 
-    // 7. Create pooled ash and dust particles (zero runtime allocation)
+    // 6. Create Stage 2 8-directional Hero ("Эйден, Страж Разлома")
+    this.createHero(save.playerPosition.x, save.playerPosition.y);
+
+    // 7. Create pooled ash and footstep dust particles
     this.createParticlePools();
 
-    // 8. Check initial state (title tour vs direct ?autostart=1 playing)
+    // 8. Apply initial shell state
     const initialState = (document.body.dataset.state as GameShellState) || 'title';
     this.applyShellState(initialState, true);
 
@@ -115,11 +129,14 @@ export class ThresholdScene extends Phaser.Scene {
     this.unsubscribeReset = eventBus.on('save:reset', (freshSave) => {
       this.sessionPlayTimeSec = freshSave.playTimeSeconds;
       this.facing = freshSave.playerPosition.facing;
-      this.discoveredWaystonesCount = freshSave.discoveredWaystones.length;
+      this.discoveredWaystones = new Set(freshSave.discoveredWaystones);
+      this.discoveredInteractables = new Set(freshSave.discoveredInteractables);
       this.seeker.setPosition(freshSave.playerPosition.x, freshSave.playerPosition.y);
       this.seeker.body.setVelocity(0, 0);
-      this.refreshWaystoneVisuals(freshSave.discoveredWaystones);
-      this.emitTelemetry(0, undefined, true);
+      this.playHeroAnimation('idle', this.facing);
+      this.seeker.setDepth(computeYSortDepth(this.seeker.y));
+      this.refreshWorldDiscoveryVisuals();
+      this.emitTelemetry(undefined, undefined, true);
     });
 
     this.unsubscribeSaveReq = bindLiveSceneSaveHandler({
@@ -131,11 +148,13 @@ export class ThresholdScene extends Phaser.Scene {
       }),
       onSaved: (updatedSave, nearestWaystone) => {
         soundFX.playWaystoneAttune();
+        this.discoveredWaystones = new Set(updatedSave.discoveredWaystones);
+        this.discoveredInteractables = new Set(updatedSave.discoveredInteractables);
         if (nearestWaystone) {
-          this.spawnDustBurst(nearestWaystone.x, nearestWaystone.y - 16, 12, 0xfbbf24);
-          this.refreshWaystoneVisuals(updatedSave.discoveredWaystones);
+          this.spawnDustBurst(nearestWaystone.x, nearestWaystone.y - 12, 12, 0xfbbf24);
         }
-        this.emitTelemetry(this.time.now, nearestWaystone, true);
+        this.refreshWorldDiscoveryVisuals();
+        this.emitTelemetry(nearestWaystone, undefined, true);
       },
     });
 
@@ -147,200 +166,313 @@ export class ThresholdScene extends Phaser.Scene {
       this.dustPool = [];
       this.waystoneSprites.clear();
       this.waystoneRings.clear();
+      this.interactableSprites.clear();
+      this.interactableRings.clear();
     });
   }
 
-  private createParallaxBackdrop(): void {
-    const sky = this.add.graphics();
-    sky.setScrollFactor(0);
-    sky.setDepth(-100);
-    sky.fillGradientStyle(0x070a10, 0x070a10, 0x131b2b, 0x182132, 1);
-    sky.fillRect(0, 0, GAME_CONFIG.LOGICAL_WIDTH, GAME_CONFIG.LOGICAL_HEIGHT);
+  private createTerrainAndRoads(): void {
+    // Viewport-sized dark-fantasy turf synced to camera scroll (4.2x lower pixel fill-rate)
+    this.turfTile = this.add.tileSprite(
+      0,
+      0,
+      GAME_CONFIG.LOGICAL_WIDTH,
+      GAME_CONFIG.LOGICAL_HEIGHT,
+      ASSET_KEYS.TERRAIN_ASHEN_TURF
+    );
+    this.turfTile.setOrigin(0, 0);
+    this.turfTile.setScrollFactor(0);
+    this.turfTile.setDepth(-2000);
 
-    const eclipse = this.add.graphics();
-    eclipse.setScrollFactor(0.06, 0.04);
-    eclipse.setDepth(-90);
-    eclipse.fillStyle(0xf59e0b, 0.08);
-    eclipse.fillCircle(880, 165, 118);
-    eclipse.lineStyle(2, 0xf59e0b, 0.35);
-    eclipse.strokeCircle(880, 165, 68);
-    eclipse.fillStyle(0x080b12, 1);
-    eclipse.fillCircle(880, 165, 65);
+    // Paved cobblestone roads & sanctuary mosaic plazas
+    const roadFrameGraphics = this.add.graphics();
+    roadFrameGraphics.setDepth(-1850);
 
-    const farMountains = this.add.graphics();
-    farMountains.setScrollFactor(0.18, 0.08);
-    farMountains.setDepth(-80);
-    farMountains.fillStyle(0x0e1420, 1);
-    farMountains.beginPath();
-    farMountains.moveTo(0, 720);
-    const farPeaks = [
-      [0, 440],
-      [190, 310],
-      [370, 410],
-      [580, 250],
-      [790, 390],
-      [1040, 280],
-      [1290, 420],
-      [1520, 270],
-      [1780, 380],
-      [2040, 310],
-    ];
-    for (const [px, py] of farPeaks) {
-      farMountains.lineTo(px, py);
+    for (const patch of THRESHOLD_ROADS) {
+      const texKey =
+        patch.surface === 'sanctuary_mosaic'
+          ? ASSET_KEYS.TERRAIN_SANCTUARY_MOSAIC
+          : ASSET_KEYS.TERRAIN_COBBLESTONE;
+
+      const tile = this.add.tileSprite(patch.x, patch.y, patch.width, patch.height, texKey);
+      tile.setDepth(-1900);
+
+      // Carved stone curbing border around roads and plazas
+      const borderColor = patch.surface === 'sanctuary_mosaic' ? 0xd97706 : 0x334155;
+      roadFrameGraphics.lineStyle(2.5, borderColor, 0.55);
+      roadFrameGraphics.strokeRoundedRect(
+        patch.x - patch.width * 0.5,
+        patch.y - patch.height * 0.5,
+        patch.width,
+        patch.height,
+        10
+      );
     }
-    farMountains.lineTo(2200, 720);
-    farMountains.closePath();
-    farMountains.fill();
 
-    const midRuins = this.add.graphics();
-    midRuins.setScrollFactor(0.38, 0.15);
-    midRuins.setDepth(-65);
-    midRuins.fillStyle(0x131b2a, 0.92);
-    for (let i = 0; i < 14; i++) {
-      const bx = i * 190 + 60;
-      const topY = 390 + (i % 3) * 28;
-      midRuins.fillRect(bx, topY, 36, 360);
-      midRuins.fillRect(bx - 12, topY, 60, 14);
-    }
+    // Perimeter stone cliff border frame
+    const borderGfx = this.add.graphics();
+    borderGfx.setDepth(-1750);
+    borderGfx.fillStyle(0x080b11, 0.92);
+    const m = GAME_CONFIG.WORLD_MARGIN;
+    borderGfx.fillRect(0, 0, GAME_CONFIG.WORLD_WIDTH, m);
+    borderGfx.fillRect(0, GAME_CONFIG.WORLD_HEIGHT - m, GAME_CONFIG.WORLD_WIDTH, m);
+    borderGfx.fillRect(0, 0, m, GAME_CONFIG.WORLD_HEIGHT);
+    borderGfx.fillRect(GAME_CONFIG.WORLD_WIDTH - m, 0, m, GAME_CONFIG.WORLD_HEIGHT);
+
+    borderGfx.lineStyle(3, 0x475569, 0.7);
+    borderGfx.strokeRect(
+      m,
+      m,
+      GAME_CONFIG.WORLD_WIDTH - m * 2,
+      GAME_CONFIG.WORLD_HEIGHT - m * 2
+    );
   }
 
-  private createRuinProps(): void {
+  private addStaticFootprintCollider(
+    centerX: number,
+    centerY: number,
+    width: number,
+    height: number
+  ): void {
+    const zone = this.add.zone(centerX, centerY, width, height);
+    this.physics.add.existing(zone, true);
+    this.obstaclesGroup.add(zone);
+  }
+
+  private createWorldProps(): void {
+    const ambientLights = this.add.graphics();
+    ambientLights.setDepth(-1700);
+
     for (const prop of THRESHOLD_PROPS) {
       let texKey: string = ASSET_KEYS.PROP_PILLAR;
-      const originY = 1;
-      let depth = -20;
+      let originY = 0.92;
 
-      if (prop.kind === 'archway') {
-        texKey = ASSET_KEYS.PROP_ARCHWAY;
-        depth = -25;
-      } else if (prop.kind === 'brazier') {
-        texKey = ASSET_KEYS.PROP_BRAZIER;
-        depth = -15;
-      } else if (prop.kind === 'rift_fissure') {
-        texKey = ASSET_KEYS.PROP_RIFT_FISSURE;
-        depth = -30;
+      switch (prop.kind) {
+        case 'archway':
+          texKey = ASSET_KEYS.PROP_ARCHWAY;
+          originY = 0.95;
+          break;
+        case 'pillar':
+          texKey = ASSET_KEYS.PROP_PILLAR;
+          originY = 0.94;
+          break;
+        case 'brazier':
+          texKey = ASSET_KEYS.PROP_BRAZIER;
+          originY = 0.9;
+          ambientLights.fillStyle(0xf59e0b, 0.08);
+          ambientLights.fillCircle(prop.x, prop.y - 12, 85);
+          break;
+        case 'ashen_tree':
+          texKey = ASSET_KEYS.PROP_ASHEN_TREE;
+          originY = 0.92;
+          break;
+        case 'boulder':
+          texKey = ASSET_KEYS.PROP_BOULDER;
+          originY = 0.88;
+          break;
+        case 'ruin_wall':
+          texKey = ASSET_KEYS.PROP_RUIN_WALL;
+          originY = 0.88;
+          break;
+        case 'rift_fissure':
+          texKey = ASSET_KEYS.PROP_RIFT_FISSURE;
+          originY = 0.6;
+          break;
       }
 
       const img = this.add.image(prop.x, prop.y, texKey);
       img.setOrigin(0.5, originY);
       img.setScale(prop.scale);
-      img.setDepth(depth);
-    }
-  }
 
-  private createPlatforms(): void {
-    this.platformsGroup = this.physics.add.staticGroup();
-
-    for (const spec of THRESHOLD_PLATFORMS) {
-      const tileSprite = this.add.tileSprite(
-        spec.x,
-        spec.y,
-        spec.width,
-        spec.height,
-        ASSET_KEYS.BASALT_PLATFORM_TILE
-      );
-      tileSprite.setDepth(0);
-
-      const border = this.add.graphics();
-      border.setDepth(1);
-      border.lineStyle(1.5, spec.kind === 'terrace' ? 0xd97706 : 0x475569, 0.55);
-      border.strokeRect(
-        spec.x - spec.width * 0.5,
-        spec.y - spec.height * 0.5,
-        spec.width,
-        spec.height
-      );
-
-      this.physics.add.existing(tileSprite, true);
-      if (spec.oneWayUp && tileSprite.body) {
-        const staticBody = tileSprite.body as Phaser.Physics.Arcade.StaticBody;
-        staticBody.checkCollision.down = false;
-        staticBody.checkCollision.left = false;
-        staticBody.checkCollision.right = false;
-        staticBody.checkCollision.up = true;
+      if (prop.isGroundDecal) {
+        img.setDepth(-1600);
+      } else {
+        img.setDepth(computeYSortDepth(prop.y));
       }
-      this.platformsGroup.add(tileSprite);
+
+      if (prop.collider) {
+        this.addStaticFootprintCollider(
+          prop.x + (prop.collider.offsetX ?? 0),
+          prop.y + (prop.collider.offsetY ?? -8),
+          prop.collider.width,
+          prop.collider.height
+        );
+      }
     }
   }
 
-  private createWaystones(discoveredIds: string[]): void {
-    const discoveredSet = new Set(discoveredIds);
-
+  private createWaystones(): void {
     for (const ws of THRESHOLD_WAYSTONES) {
-      const isDiscovered = discoveredSet.has(ws.id);
+      const isDiscovered = this.discoveredWaystones.has(ws.id);
+
+      const ring = this.add.ellipse(ws.x, ws.y - 4, 108, 46, 0xf59e0b, 0.08);
+      ring.setStrokeStyle(1.8, isDiscovered ? 0xf59e0b : 0x38bdf8, 0.55);
+      ring.setDepth(-1500);
+      this.waystoneRings.set(ws.id, ring);
+
       const sprite = this.add.image(
         ws.x,
         ws.y,
         isDiscovered ? ASSET_KEYS.WAYSTONE_ACTIVE : ASSET_KEYS.WAYSTONE_DORMANT
       );
-      sprite.setOrigin(0.5, 0.94);
-      sprite.setDepth(-5);
+      sprite.setOrigin(0.5, 0.92);
+      sprite.setDepth(computeYSortDepth(ws.y));
       this.waystoneSprites.set(ws.id, sprite);
 
-      const ring = this.add.circle(ws.x, ws.y - 6, 48, 0xf59e0b, 0.08);
-      ring.setStrokeStyle(1.5, isDiscovered ? 0xf59e0b : 0x38bdf8, 0.45);
-      ring.setScale(1, 0.28);
-      ring.setDepth(-4);
-      this.waystoneRings.set(ws.id, ring);
+      const label = this.add.text(ws.x, ws.y - 162, ws.name, {
+        fontFamily: 'Cinzel, serif',
+        fontSize: '12px',
+        color: '#fde68a',
+        backgroundColor: 'rgba(9, 12, 20, 0.78)',
+        padding: { x: 6, y: 2 },
+      });
+      label.setOrigin(0.5, 1);
+      label.setDepth(computeYSortDepth(ws.y, 15));
+
+      this.addStaticFootprintCollider(ws.x, ws.y - 10, ws.colliderWidth, ws.colliderHeight);
     }
   }
 
-  private refreshWaystoneVisuals(discoveredIds: string[]): void {
-    const discoveredSet = new Set(discoveredIds);
-    this.discoveredWaystonesCount = discoveredSet.size;
+  private createInteractables(): void {
+    for (const item of THRESHOLD_INTERACTABLES) {
+      const isDiscovered = this.discoveredInteractables.has(item.id);
+
+      let texKey: string = ASSET_KEYS.PROP_LORE_SHRINE;
+      let labelOffsetY = -98;
+
+      switch (item.kind) {
+        case 'npc_warden':
+          texKey = ASSET_KEYS.NPC_WARDEN;
+          labelOffsetY = -98;
+          break;
+        case 'npc_smith':
+          texKey = ASSET_KEYS.NPC_SMITH;
+          labelOffsetY = -96;
+          break;
+        case 'lore_shrine':
+          texKey = ASSET_KEYS.PROP_LORE_SHRINE;
+          labelOffsetY = -108;
+          break;
+        case 'reliquary_chest':
+          texKey = isDiscovered ? ASSET_KEYS.PROP_CHEST_OPEN : ASSET_KEYS.PROP_CHEST_CLOSED;
+          labelOffsetY = -56;
+          break;
+        case 'campfire':
+          texKey = ASSET_KEYS.PROP_CAMPFIRE;
+          labelOffsetY = -58;
+          break;
+      }
+
+      const ring = this.add.ellipse(item.x, item.y - 3, 72, 30, 0x38bdf8, 0.07);
+      ring.setStrokeStyle(1.4, isDiscovered ? 0x10b981 : 0xf59e0b, 0.5);
+      ring.setDepth(-1500);
+      this.interactableRings.set(item.id, ring);
+
+      const sprite = this.add.image(item.x, item.y, texKey);
+      sprite.setOrigin(0.5, 0.88);
+      sprite.setDepth(computeYSortDepth(item.y));
+      this.interactableSprites.set(item.id, sprite);
+
+      const nameTag = this.add.text(item.x, item.y + labelOffsetY, item.name, {
+        fontFamily: 'Inter, sans-serif',
+        fontSize: '11px',
+        color: '#f3ede0',
+        backgroundColor: 'rgba(13, 18, 29, 0.82)',
+        padding: { x: 5, y: 2 },
+      });
+      nameTag.setOrigin(0.5, 1);
+      nameTag.setDepth(computeYSortDepth(item.y, 12));
+
+      if (item.collider) {
+        this.addStaticFootprintCollider(
+          item.x,
+          item.y + (item.collider.offsetY ?? -8),
+          item.collider.width,
+          item.collider.height
+        );
+      }
+    }
+  }
+
+  private refreshWorldDiscoveryVisuals(): void {
     for (const ws of THRESHOLD_WAYSTONES) {
-      const active = discoveredSet.has(ws.id);
+      const active = this.discoveredWaystones.has(ws.id);
       const sprite = this.waystoneSprites.get(ws.id);
       if (sprite) {
         sprite.setTexture(active ? ASSET_KEYS.WAYSTONE_ACTIVE : ASSET_KEYS.WAYSTONE_DORMANT);
       }
       const ring = this.waystoneRings.get(ws.id);
       if (ring) {
-        ring.setStrokeStyle(1.5, active ? 0xf59e0b : 0x38bdf8, 0.55);
+        ring.setStrokeStyle(1.8, active ? 0xf59e0b : 0x38bdf8, 0.6);
+      }
+    }
+
+    for (const item of THRESHOLD_INTERACTABLES) {
+      const done = this.discoveredInteractables.has(item.id);
+      if (item.kind === 'reliquary_chest') {
+        const sprite = this.interactableSprites.get(item.id);
+        if (sprite) {
+          sprite.setTexture(done ? ASSET_KEYS.PROP_CHEST_OPEN : ASSET_KEYS.PROP_CHEST_CLOSED);
+        }
+      }
+      const ring = this.interactableRings.get(item.id);
+      if (ring) {
+        ring.setStrokeStyle(1.4, done ? 0x10b981 : 0xf59e0b, 0.55);
       }
     }
   }
 
-  private createSeeker(startX: number, startY: number): void {
-    this.seeker = this.physics.add.sprite(startX, startY, ASSET_KEYS.SEEKER_IDLE);
-    this.seeker.setDepth(10);
+  private createHero(startX: number, startY: number): void {
+    this.seeker = this.physics.add.sprite(startX, startY, ASSET_KEYS.HERO_SPRITESHEET, 0);
+    // Anchor at feet (48, 94 inside 96x112 frame -> origin (0.5, 0.84))
+    this.seeker.setOrigin(0.5, 0.84);
     this.seeker.setCollideWorldBounds(true);
 
-    this.seeker.body.setSize(34, 78);
-    this.seeker.body.setOffset(31, 20);
-    this.seeker.body.setMaxVelocity(750, 960);
-    this.seeker.setFlipX(this.facing === 'left');
+    // Compact ground footprint collider around the hero's boots
+    this.seeker.body.setSize(32, 22);
+    this.seeker.body.setOffset(32, 74);
 
-    this.physics.add.collider(this.seeker, this.platformsGroup);
+    this.playHeroAnimation('idle', this.facing);
+    this.seeker.setDepth(computeYSortDepth(this.seeker.y));
+
+    this.physics.add.collider(this.seeker, this.obstaclesGroup);
+  }
+
+  private playHeroAnimation(mode: 'idle' | 'walk', dir: FacingDirection): void {
+    const key = getHeroAnimKey(mode, dir);
+    if (this.currentAnimKey !== key || !this.seeker.anims.isPlaying) {
+      this.currentAnimKey = key;
+      this.seeker.play(key, true);
+    }
   }
 
   private createParticlePools(): void {
     for (let i = 0; i < 36; i++) {
       const sprite = this.add.image(
         Math.random() * GAME_CONFIG.WORLD_WIDTH,
-        Math.random() * (GAME_CONFIG.WORLD_HEIGHT - 120),
+        Math.random() * GAME_CONFIG.WORLD_HEIGHT,
         ASSET_KEYS.ASH_MOTE
       );
-      sprite.setDepth(18);
-      sprite.setAlpha(0.2 + Math.random() * 0.45);
+      sprite.setDepth(18000);
+      sprite.setAlpha(0.22 + Math.random() * 0.45);
       sprite.setScale(0.45 + Math.random() * 0.7);
       this.ashPool.push({
         sprite,
-        vx: -14 - Math.random() * 22,
-        vy: -6 - Math.random() * 14,
+        vx: -14 - Math.random() * 20,
+        vy: -8 - Math.random() * 14,
         phase: Math.random() * Math.PI * 2,
       });
     }
 
-    for (let i = 0; i < 18; i++) {
-      const graphic = this.add.circle(-100, -100, 4, 0x94a3b8, 0);
-      graphic.setDepth(9);
+    for (let i = 0; i < 16; i++) {
+      const graphic = this.add.circle(-100, -100, 3.5, 0x94a3b8, 0);
+      graphic.setDepth(-1400);
       this.dustPool.push({
         graphic,
         vx: 0,
         vy: 0,
         life: 0,
-        maxLife: 0.35,
+        maxLife: 0.3,
       });
     }
   }
@@ -349,12 +481,12 @@ export class ThresholdScene extends Phaser.Scene {
     let spawned = 0;
     for (const p of this.dustPool) {
       if (p.life <= 0) {
-        p.graphic.setPosition(x + (Math.random() - 0.5) * 20, y);
-        p.graphic.setFillStyle(color, 0.75);
-        p.graphic.setScale(0.7 + Math.random() * 0.6);
-        p.vx = (Math.random() - 0.5) * 140;
-        p.vy = -30 - Math.random() * 90;
-        p.maxLife = 0.24 + Math.random() * 0.16;
+        p.graphic.setPosition(x + (Math.random() - 0.5) * 18, y + (Math.random() - 0.5) * 8);
+        p.graphic.setFillStyle(color, 0.72);
+        p.graphic.setScale(0.7 + Math.random() * 0.5);
+        p.vx = (Math.random() - 0.5) * 90;
+        p.vy = (Math.random() - 0.5) * 60 - 15;
+        p.maxLife = 0.24 + Math.random() * 0.14;
         p.life = p.maxLife;
         spawned++;
         if (spawned >= count) break;
@@ -370,8 +502,8 @@ export class ThresholdScene extends Phaser.Scene {
       this.physics.world.pause();
       this.cameras.main.stopFollow();
       if (immediate) {
-        this.cameras.main.scrollX = 220;
-        this.cameras.main.scrollY = 140;
+        this.cameras.main.scrollX = 610;
+        this.cameras.main.scrollY = 420;
       }
     } else if (nextState === 'playing') {
       this.physics.world.resume();
@@ -381,9 +513,9 @@ export class ThresholdScene extends Phaser.Scene {
         GAME_CONFIG.CAMERA_LERP_X,
         GAME_CONFIG.CAMERA_LERP_Y,
         0,
-        -35
+        0
       );
-      this.emitTelemetry(this.time.now, undefined, true);
+      this.emitTelemetry(undefined, undefined, true);
     } else if (nextState === 'paused') {
       this.physics.world.pause();
     }
@@ -395,13 +527,18 @@ export class ThresholdScene extends Phaser.Scene {
     this.updateAmbientParticles(time, dt);
 
     if (this.shellState === 'title') {
-      this.tourAngle += dt * 0.22;
-      const targetX = 980 + Math.sin(this.tourAngle) * 760;
-      const targetY = 125 + Math.cos(this.tourAngle * 1.5) * 35;
+      this.tourAngle += dt * 0.24;
+      const targetX = 620 + Math.sin(this.tourAngle) * 340;
+      const targetY = 380 + Math.cos(this.tourAngle * 0.8) * 210;
       this.cameras.main.scrollX += (targetX - this.cameras.main.scrollX) * 0.04;
       this.cameras.main.scrollY += (targetY - this.cameras.main.scrollY) * 0.04;
+      this.turfTile.tilePositionX = this.cameras.main.scrollX;
+      this.turfTile.tilePositionY = this.cameras.main.scrollY;
       return;
     }
+
+    this.turfTile.tilePositionX = this.cameras.main.scrollX;
+    this.turfTile.tilePositionY = this.cameras.main.scrollY;
 
     const input = inputController.consumeFrameInput();
 
@@ -420,111 +557,41 @@ export class ThresholdScene extends Phaser.Scene {
     this.autosaveTimerSec += dt;
 
     const body = this.seeker.body;
-    const grounded = body.blocked.down || body.touching.down;
+    const isMoving = input.magnitude > 0.04;
 
-    if (grounded) {
-      this.lastGroundedTime = time;
-      if (!this.wasGrounded) {
-        this.scaleSquashX = 1.2;
-        this.scaleSquashY = 0.82;
-        soundFX.playLand();
-        this.spawnDustBurst(this.seeker.x, this.seeker.y + 38, 6, 0x94a3b8);
-      }
-    }
-    this.wasGrounded = grounded;
+    if (isMoving) {
+      const vx = input.moveX * GAME_CONFIG.PLAYER_MOVE_SPEED;
+      const vy = input.moveY * GAME_CONFIG.PLAYER_MOVE_SPEED;
+      body.setVelocity(vx, vy);
 
-    if (input.jumpJustPressed) {
-      this.lastJumpPressedTime = time;
-    }
+      this.facing = resolveFacingDirection(input.moveX, input.moveY, this.facing);
+      this.playHeroAnimation('walk', this.facing);
 
-    // Dash execution
-    if (input.dashJustPressed && time >= this.dashCooldownUntil && !this.isDashing) {
-      this.isDashing = true;
-      this.dashEndTime = time + GAME_CONFIG.PLAYER_DASH_DURATION_MS;
-      this.dashCooldownUntil = time + GAME_CONFIG.PLAYER_DASH_COOLDOWN_MS;
-      if (Math.abs(input.moveX) > 0.1) {
-        this.facing = input.moveX < 0 ? 'left' : 'right';
-        this.seeker.setFlipX(this.facing === 'left');
-      }
-      const dir = this.facing === 'left' ? -1 : 1;
-      body.setAllowGravity(false);
-      body.setVelocity(dir * GAME_CONFIG.PLAYER_DASH_SPEED, 0);
-      this.scaleSquashX = 1.26;
-      this.scaleSquashY = 0.78;
-      soundFX.playDash();
-      this.spawnDustBurst(this.seeker.x, this.seeker.y + 20, 8, 0x38bdf8);
-    }
+      const frameSpeed = Math.hypot(body.velocity.x, body.velocity.y);
+      this.walkDistanceAccumulator += frameSpeed * dt;
+      this.stepSoundAccumulator += frameSpeed * dt;
 
-    if (this.isDashing) {
-      if (time >= this.dashEndTime) {
-        this.isDashing = false;
-        body.setAllowGravity(true);
-        body.setVelocityX(body.velocity.x * 0.45);
-      }
-    } else {
-      const targetVx = input.moveX * GAME_CONFIG.PLAYER_MOVE_SPEED;
-      const accelFactor = grounded ? 0.28 : 0.18;
-      const nextVx = body.velocity.x + (targetVx - body.velocity.x) * accelFactor;
-      body.setVelocityX(Math.abs(nextVx) < 4 ? 0 : nextVx);
-
-      if (Math.abs(input.moveX) > 0.08) {
-        this.facing = input.moveX < 0 ? 'left' : 'right';
-        this.seeker.setFlipX(this.facing === 'left');
-      }
-
-      const withinCoyote = time - this.lastGroundedTime <= GAME_CONFIG.COYOTE_TIME_MS;
-      const withinBuffer = time - this.lastJumpPressedTime <= GAME_CONFIG.JUMP_BUFFER_MS;
-
-      if (withinCoyote && withinBuffer) {
-        body.setVelocityY(GAME_CONFIG.PLAYER_JUMP_VELOCITY);
-        this.lastGroundedTime = 0;
-        this.lastJumpPressedTime = -9999;
-        this.scaleSquashX = 0.86;
-        this.scaleSquashY = 1.16;
-        soundFX.playJump();
-        this.spawnDustBurst(this.seeker.x, this.seeker.y + 38, 5, 0xcbd5e1);
-      }
-
-      if (!input.jumpHeld && body.velocity.y < -180) {
-        body.setVelocityY(body.velocity.y * 0.55);
-      }
-    }
-
-    // Safety guard if high-velocity collision ever pushes body below ground bottom
-    if (this.seeker.y > GAME_CONFIG.GROUND_Y - 10) {
-      this.seeker.setY(GAME_CONFIG.GROUND_Y - 38);
-      body.setVelocityY(0);
-    }
-
-    this.scaleSquashX += (1 - this.scaleSquashX) * Math.min(1, dt * 14);
-    this.scaleSquashY += (1 - this.scaleSquashY) * Math.min(1, dt * 14);
-    this.seeker.setScale(this.scaleSquashX, this.scaleSquashY);
-
-    const speedX = Math.abs(body.velocity.x);
-    if (this.isDashing) {
-      this.seeker.setTexture(ASSET_KEYS.SEEKER_DASH);
-    } else if (!grounded) {
-      this.seeker.setTexture(ASSET_KEYS.SEEKER_AIR);
-    } else if (speedX > 24) {
-      this.walkDistanceAccumulator += speedX * dt;
-      this.stepSoundAccumulator += speedX * dt;
-      const cycle = Math.floor(this.walkDistanceAccumulator / 42) % 2;
-      this.seeker.setTexture(
-        cycle === 0 ? ASSET_KEYS.SEEKER_WALK_1 : ASSET_KEYS.SEEKER_WALK_2
-      );
-
-      if (this.stepSoundAccumulator >= 95) {
+      if (this.stepSoundAccumulator >= 88) {
         this.stepSoundAccumulator = 0;
         soundFX.playStep();
+        this.spawnDustBurst(this.seeker.x, this.seeker.y + 2, 2, 0x64748b);
       }
     } else {
-      this.seeker.setTexture(ASSET_KEYS.SEEKER_IDLE);
+      body.setVelocity(0, 0);
+      this.playHeroAnimation('idle', this.facing);
     }
 
+    // Dynamic Y-sorting based on hero's live ground-contact Y coordinate
+    this.seeker.setDepth(computeYSortDepth(this.seeker.y));
+
     const nearestWaystone = findNearestWaystone(this.seeker.x, this.seeker.y);
+    const nearestInteractable = findNearestInteractable(this.seeker.x, this.seeker.y);
+
     if (input.interactJustPressed) {
       if (nearestWaystone) {
         this.attuneWaystone(nearestWaystone);
+      } else if (nearestInteractable) {
+        this.interactWithWorldObject(nearestInteractable);
       } else {
         this.manualSaveAtPosition();
       }
@@ -540,12 +607,15 @@ export class ThresholdScene extends Phaser.Scene {
       });
     }
 
-    this.emitTelemetry(time, nearestWaystone, false);
+    this.emitTelemetry(nearestWaystone, nearestInteractable, false);
   }
 
   private attuneWaystone(ws: WaystoneSpec): void {
     soundFX.playWaystoneAttune();
-    this.spawnDustBurst(ws.x, ws.y - 16, 12, 0xfbbf24);
+    this.spawnDustBurst(ws.x, ws.y - 10, 12, 0xfbbf24);
+
+    const isFirstDiscovery = !this.discoveredWaystones.has(ws.id);
+    const xpGain = isFirstDiscovery ? 35 : 0;
 
     void saveManager
       .saveGame({
@@ -554,21 +624,63 @@ export class ThresholdScene extends Phaser.Scene {
         facing: this.facing,
         activeWaystoneId: ws.id,
         discoveredWaystoneId: ws.id,
+        xpGain,
+        restoreVitals: true,
         playTimeSeconds: this.sessionPlayTimeSec,
       })
       .then((updatedSave) => {
-        this.refreshWaystoneVisuals(updatedSave.discoveredWaystones);
+        this.discoveredWaystones = new Set(updatedSave.discoveredWaystones);
+        this.refreshWorldDiscoveryVisuals();
         eventBus.emit('waystone:attuned', { id: ws.id, name: ws.name, save: updatedSave });
         eventBus.emit('save:completed', updatedSave);
         eventBus.emit('toast:message', {
-          text: `Обелиск активирован: ${ws.name} · Прогресс сохранён`,
+          text: isFirstDiscovery
+            ? `Обелиск пробуждён: ${ws.name} (+${xpGain} ОП) · Здоровье и эфир восстановлены`
+            : `Резонанс с обелиском: ${ws.name} · Прогресс сохранён`,
           tone: 'amber',
         });
-        this.emitTelemetry(this.time.now, ws, true);
+        this.emitTelemetry(ws, undefined, true);
       })
       .catch((err: unknown) => {
         const reason =
           err instanceof Error ? err.message : 'Не удалось записать активацию обелиска';
+        eventBus.emit('save:failed', { reason });
+      });
+  }
+
+  private interactWithWorldObject(item: WorldInteractableSpec): void {
+    soundFX.playWaystoneAttune();
+    this.spawnDustBurst(item.x, item.y - 8, 8, 0x38bdf8);
+
+    const isFirstTime = !this.discoveredInteractables.has(item.id);
+    const xpGranted = isFirstTime ? item.xpReward : 0;
+
+    void saveManager
+      .saveGame({
+        x: this.seeker.x,
+        y: this.seeker.y,
+        facing: this.facing,
+        discoveredInteractableId: item.id,
+        xpGain: xpGranted,
+        restoreVitals: item.kind === 'campfire',
+        playTimeSeconds: this.sessionPlayTimeSec,
+      })
+      .then((updatedSave) => {
+        this.discoveredInteractables = new Set(updatedSave.discoveredInteractables);
+        this.refreshWorldDiscoveryVisuals();
+        eventBus.emit('save:completed', updatedSave);
+        eventBus.emit('world:interacted', {
+          id: item.id,
+          speakerName: item.name,
+          roleTitle: item.roleTitle,
+          lines: item.dialogueLines,
+          xpGranted,
+        });
+        this.emitTelemetry(undefined, item, true);
+      })
+      .catch((err: unknown) => {
+        const reason =
+          err instanceof Error ? err.message : 'Не удалось сохранить взаимодействие с миром';
         eventBus.emit('save:failed', { reason });
       });
   }
@@ -601,7 +713,7 @@ export class ThresholdScene extends Phaser.Scene {
       mote.sprite.x += (mote.vx + Math.sin(time * 0.0015 + mote.phase) * 8) * dt;
       mote.sprite.y += mote.vy * dt;
       if (mote.sprite.x < 0) mote.sprite.x = GAME_CONFIG.WORLD_WIDTH;
-      if (mote.sprite.y < 0) mote.sprite.y = GAME_CONFIG.WORLD_HEIGHT - 80;
+      if (mote.sprite.y < 0) mote.sprite.y = GAME_CONFIG.WORLD_HEIGHT;
     }
 
     for (const p of this.dustPool) {
@@ -616,45 +728,60 @@ export class ThresholdScene extends Phaser.Scene {
   }
 
   private emitTelemetry(
-    time: number,
-    precomputedNearest?: WaystoneSpec | null,
+    precomputedWaystone?: WaystoneSpec | null,
+    precomputedInteractable?: WorldInteractableSpec | null,
     force: boolean = false
   ): void {
-    const nearest =
-      precomputedNearest !== undefined
-        ? precomputedNearest
+    const nearestWs =
+      precomputedWaystone !== undefined
+        ? precomputedWaystone
         : findNearestWaystone(this.seeker.x, this.seeker.y);
-    const dashRemaining = Math.max(0, this.dashCooldownUntil - time);
-    const dashCooldownRatio = Number(
-      (dashRemaining / GAME_CONFIG.PLAYER_DASH_COOLDOWN_MS).toFixed(1)
-    );
+    const nearestInter =
+      precomputedInteractable !== undefined
+        ? precomputedInteractable
+        : findNearestInteractable(this.seeker.x, this.seeker.y);
 
     const rx = Math.round(this.seeker.x);
     const ry = Math.round(this.seeker.y);
-    const grounded = this.seeker.body.blocked.down || this.seeker.body.touching.down;
-    const nearestId = nearest ? nearest.id : null;
+    const vx = Math.round(this.seeker.body.velocity.x);
+    const vy = Math.round(this.seeker.body.velocity.y);
+    const moving = Math.hypot(vx, vy) > 4;
+    const wsId = nearestWs ? nearestWs.id : '';
+    const interId = nearestInter ? nearestInter.id : '';
+    const save = saveManager.getCurrentSave();
 
-    // Throttle DOM updates: only emit when discrete visible values change
-    const stateHash = `${rx}|${ry}|${grounded ? 1 : 0}|${this.isDashing ? 1 : 0}|${dashCooldownRatio}|${nearestId ?? ''}|${this.discoveredWaystonesCount}`;
+    const stateHash = `${rx}|${ry}|${moving ? 1 : 0}|${this.facing}|${this.currentAnimKey}|${wsId}|${interId}|${this.discoveredWaystones.size}|${this.discoveredInteractables.size}|${save.heroStats.level}|${save.heroStats.xp}|${save.heroStats.hp}`;
     if (!force && stateHash === this.lastTelemetryHash) {
       return;
     }
     this.lastTelemetryHash = stateHash;
 
+    const actionLabel = nearestWs
+      ? 'Резонанс'
+      : nearestInter
+        ? nearestInter.actionLabel
+        : 'Сохранить';
+
     eventBus.emit('telemetry:updated', {
       x: rx,
       y: ry,
-      vx: Math.round(this.seeker.body.velocity.x),
-      vy: Math.round(this.seeker.body.velocity.y),
-      grounded,
-      dashing: this.isDashing,
-      dashCooldownRatio,
+      vx,
+      vy,
+      moving,
       facing: this.facing,
-      nearestWaystoneId: nearestId,
-      nearestWaystoneName: nearest ? nearest.name : null,
-      discoveredCount: this.discoveredWaystonesCount,
+      animationKey: this.currentAnimKey,
+      nearestWaystoneId: nearestWs ? nearestWs.id : null,
+      nearestWaystoneName: nearestWs ? nearestWs.name : null,
+      nearestInteractableId: nearestInter ? nearestInter.id : null,
+      nearestInteractableName: nearestInter ? nearestInter.name : null,
+      nearestInteractableRole: nearestInter ? nearestInter.roleTitle : null,
+      nearestActionLabel: actionLabel,
+      discoveredWaystonesCount: this.discoveredWaystones.size,
       totalWaystones: THRESHOLD_WAYSTONES.length,
-      zoneTitle: resolveZoneTitle(rx),
+      discoveredInteractablesCount: this.discoveredInteractables.size,
+      totalInteractables: THRESHOLD_INTERACTABLES.length,
+      zoneTitle: resolveZoneTitle(rx, ry),
+      heroStats: save.heroStats,
     });
   }
 }

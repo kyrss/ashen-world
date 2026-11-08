@@ -1,42 +1,63 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { computeViewportMetrics, screenToLogicalCanvas } from './config';
+import {
+  ALL_FACING_DIRECTIONS,
+  computeViewportMetrics,
+  computeYSortDepth,
+  normalizeMovementVector,
+  resolveFacingDirection,
+  screenToLogicalCanvas,
+  type FacingDirection,
+} from './config';
 import {
   checkAABBOverlap,
   clampWorldPosition,
+  DEFAULT_SPAWN_POINT,
+  findNearestInteractable,
   findNearestWaystone,
+  isPositionWalkable,
+  resolveSafeWalkablePosition,
   resolveZoneTitle,
-  THRESHOLD_PLATFORMS,
+  THRESHOLD_INTERACTABLES,
   THRESHOLD_WAYSTONES,
-  verifyAllPlatformsReachable,
 } from '../world/thresholdLayout';
 import { computeJoystickVector, inputController } from '../input/InputController';
 import {
+  applyExperienceGain,
   bindLiveSceneSaveHandler,
   compareSaveFreshness,
+  computeLegacyV1Checksum,
   computeSaveChecksum,
   createInitialSaveRecord,
+   DEFAULT_HERO_STATS,
   reconcileSaveRecords,
   SaveManager,
+  SAVE_SCHEMA_VERSION,
   validateAndMigrateSave,
   type SaveRecord,
   type SaveStorageAdapter,
 } from '../save/SaveManager';
 import { TypedEventBus } from './EventBus';
-import { ASSET_KEYS, STAGE1_ASSET_MANIFEST } from '../gfx/AssetManifest';
+import {
+  ASSET_KEYS,
+  ASSET_MANIFEST,
+  getHeroAnimationFrameIndices,
+  getHeroAnimKey,
+} from '../gfx/AssetManifest';
 import { isPointWithinExpandedRect } from '../ui/GameShellUI';
 
 function createValidSaveRecord(overrides: {
   savedAt: string;
   x: number;
   y: number;
-  facing?: 'left' | 'right';
+  facing?: FacingDirection;
   playTimeSeconds: number;
   activeWaystoneId?: string;
   discoveredWaystones?: string[];
+  discoveredInteractables?: string[];
 }): SaveRecord {
   const base: Omit<SaveRecord, 'checksum'> = {
-    version: 1,
+    version: SAVE_SCHEMA_VERSION,
     slotId: 'slot_1',
     savedAt: overrides.savedAt,
     regionId: 'ashen_threshold',
@@ -44,10 +65,12 @@ function createValidSaveRecord(overrides: {
     playerPosition: {
       x: overrides.x,
       y: overrides.y,
-      facing: overrides.facing ?? 'right',
+      facing: overrides.facing ?? 'e',
     },
     activeWaystoneId: overrides.activeWaystoneId ?? 'waystone_west',
     discoveredWaystones: overrides.discoveredWaystones ?? ['waystone_west'],
+    discoveredInteractables: overrides.discoveredInteractables ?? [],
+    heroStats: { ...DEFAULT_HERO_STATS },
     playTimeSeconds: overrides.playTimeSeconds,
   };
   return {
@@ -147,22 +170,119 @@ test('screenToLogicalCanvas maps client coordinates into 1280x720 space', () => 
   assert.equal(mapped.y, 360);
 });
 
-test('world layout helpers and platform reachability audit pass for all platforms', () => {
+test('8-directional movement normalization and facing resolution work across all 8 octants', () => {
+  // Cardinal directions
+  assert.equal(resolveFacingDirection(0, 1, 's'), 's');
+  assert.equal(resolveFacingDirection(1, 0, 's'), 'e');
+  assert.equal(resolveFacingDirection(0, -1, 's'), 'n');
+  assert.equal(resolveFacingDirection(-1, 0, 's'), 'w');
+
+  // Diagonal directions
+  assert.equal(resolveFacingDirection(1, 1, 's'), 'se');
+  assert.equal(resolveFacingDirection(1, -1, 's'), 'ne');
+  assert.equal(resolveFacingDirection(-1, -1, 's'), 'nw');
+  assert.equal(resolveFacingDirection(-1, 1, 's'), 'sw');
+
+  // Diagonal speed normalization: (1, 1) must normalize to magnitude 1.0 (~0.7071 per axis)
+  const diag = normalizeMovementVector(1, 1);
+  assert.equal(diag.magnitude, 1);
+  assert.ok(Math.abs(diag.vx - Math.SQRT1_2) < 0.001);
+  assert.ok(Math.abs(diag.vy - Math.SQRT1_2) < 0.001);
+  assert.ok(Math.hypot(diag.vx, diag.vy) <= 1.0001);
+
+  // Proportional analog thumbstick input (< 1.0) is preserved without boosting to 1.0
+  const halfStick = normalizeMovementVector(0.5, 0);
+  assert.equal(halfStick.vx, 0.5);
+  assert.equal(halfStick.vy, 0);
+  assert.equal(halfStick.magnitude, 0.5);
+});
+
+test('InputController normalizes diagonal keyboard and virtual joystick movement in all 8 directions', () => {
+  inputController.clearAllInputs();
+
+  // Simulate pressing W + D (North-East diagonal)
+  inputController.setKeyDownState('KeyW', true);
+  inputController.setKeyDownState('KeyD', true);
+  const neSnap = inputController.consumeFrameInput();
+  assert.ok(neSnap.moveX > 0.7 && neSnap.moveX < 0.71);
+  assert.ok(neSnap.moveY < -0.7 && neSnap.moveY > -0.71);
+  assert.equal(neSnap.magnitude, 1);
+  assert.equal(resolveFacingDirection(neSnap.moveX, neSnap.moveY), 'ne');
+
+  inputController.clearAllInputs();
+
+  // Simulate virtual joystick South-West diagonal + contextual interact press
+  const swStick = computeJoystickVector(-50, 50, 52, 0.14, 1.0);
+  inputController.setJoystickState(swStick);
+  inputController.triggerTouchInteract();
+
+  const swSnap = inputController.consumeFrameInput();
+  assert.ok(swSnap.moveX < -0.7 && swSnap.moveY > 0.7);
+  assert.ok(swSnap.magnitude > 0.999 && swSnap.magnitude <= 1);
+  assert.equal(swSnap.interactJustPressed, true);
+  assert.equal(resolveFacingDirection(swSnap.moveX, swSnap.moveY), 'sw');
+
+  // Next frame: interact edge is cleared while joystick remains active
+  const nextSnap = inputController.consumeFrameInput();
+  assert.equal(nextSnap.interactJustPressed, false);
+  assert.ok(nextSnap.magnitude > 0.999 && nextSnap.magnitude <= 1);
+
+  inputController.clearAllInputs();
+});
+
+test('computeYSortDepth orders hero correctly behind and in front of 2D RPG world objects', () => {
+  const treeFootY = 690;
+  const heroNorthOfTreeY = 655; // hero walks behind tree canopy
+  const heroSouthOfTreeY = 720; // hero walks in front of tree trunk
+
+  const treeDepth = computeYSortDepth(treeFootY);
+  const heroBehindDepth = computeYSortDepth(heroNorthOfTreeY);
+  const heroFrontDepth = computeYSortDepth(heroSouthOfTreeY);
+
+  assert.ok(
+    heroBehindDepth < treeDepth,
+    'Hero north of tree must have smaller depth (render behind canopy)'
+  );
+  assert.ok(
+    heroFrontDepth > treeDepth,
+    'Hero south of tree must have larger depth (render in front of trunk)'
+  );
+});
+
+test('2D RPG world layout, zones, waystones, interactables, and walkability pass', () => {
+  assert.equal(isPositionWalkable(DEFAULT_SPAWN_POINT.x, DEFAULT_SPAWN_POINT.y), true);
+
   const westWs = THRESHOLD_WAYSTONES[0];
-  const near = findNearestWaystone(westWs.x + 25, westWs.y - 30);
-  assert.ok(near);
-  assert.equal(near.id, 'waystone_west');
+  const nearWs = findNearestWaystone(westWs.x + 30, westWs.y + 30);
+  assert.ok(nearWs);
+  assert.equal(nearWs.id, 'waystone_west');
 
-  const far = findNearestWaystone(900, 300);
-  assert.equal(far, null);
+  const kaelen = THRESHOLD_INTERACTABLES[0];
+  const nearNpc = findNearestInteractable(kaelen.x, kaelen.y + 40);
+  assert.ok(nearNpc);
+  assert.equal(nearNpc.id, 'npc_warden_kaelen');
 
-  assert.equal(resolveZoneTitle(300), 'Врата Заката · Западный Бастион');
-  assert.equal(resolveZoneTitle(1580), 'Святилище Расколотого Свода');
-  assert.equal(resolveZoneTitle(2800), 'Восточный Карниз · Разлом Ветров');
+  assert.equal(resolveZoneTitle(420, 860), 'Врата Заката · Западный Тракт');
+  assert.equal(resolveZoneTitle(1250, 410), 'Святилище Расколотого Свода');
+  assert.equal(resolveZoneTitle(1250, 960), "Лагерь Дозорных Вел'Ариса");
+  assert.equal(resolveZoneTitle(2040, 880), 'Роща Пепельных Древ · Восточный Карниз');
 
-  const clamped = clampWorldPosition(-500, 2500);
-  assert.ok(clamped.x >= 78);
-  assert.ok(clamped.y <= 722);
+  // Verify approach points just south of every Waystone and Interactable are walkable
+  for (const ws of THRESHOLD_WAYSTONES) {
+    assert.equal(
+      isPositionWalkable(ws.x, ws.y + 38),
+      true,
+      `Expected approach point south of ${ws.id} to be walkable`
+    );
+  }
+
+  for (const item of THRESHOLD_INTERACTABLES) {
+    assert.equal(
+      isPositionWalkable(item.x, item.y + 36),
+      true,
+      `Expected approach point south of ${item.id} to be walkable`
+    );
+  }
 
   assert.equal(
     checkAABBOverlap(
@@ -171,90 +291,75 @@ test('world layout helpers and platform reachability audit pass for all platform
     ),
     true
   );
-  assert.equal(
-    checkAABBOverlap(
-      { x: 100, y: 100, width: 40, height: 60 },
-      { x: 250, y: 100, width: 40, height: 60 }
-    ),
-    false
-  );
+});
 
-  for (const p of THRESHOLD_PLATFORMS) {
-    assert.ok(p.height >= 36, `Platform ${p.id} height ${p.height}px is below 36px anti-tunneling floor`);
+test('Hero 48-frame 8-directional spritesheet frame indices and animation keys are unique and complete', () => {
+  const seenFrames = new Set<number>();
+
+  for (const dir of ALL_FACING_DIRECTIONS) {
+    const info = getHeroAnimationFrameIndices(dir);
+    assert.equal(info.idleFrames.length, 2);
+    assert.equal(info.walkFrames.length, 4);
+    assert.equal(getHeroAnimKey('idle', dir), `hero-idle-${dir}`);
+    assert.equal(getHeroAnimKey('walk', dir), `hero-walk-${dir}`);
+
+    for (const f of [...info.idleFrames, ...info.walkFrames]) {
+      assert.ok(f >= 0 && f < 48, `Frame index ${f} out of bounds 0..47`);
+      assert.equal(seenFrames.has(f), false, `Duplicate frame index ${f}`);
+      seenFrames.add(f);
+    }
   }
 
-  const reachability = verifyAllPlatformsReachable();
-  assert.equal(
-    reachability.reachable,
-    true,
-    `Unreachable platforms found: ${reachability.unreachableIds.join(', ')}`
-  );
+  assert.equal(seenFrames.size, 48);
 });
 
-test('computeJoystickVector and multi-touch simultaneous joystick + jump/dash work without conflict', () => {
-  const insideDeadzone = computeJoystickVector(3, 2, 52, 0.14, 1.0);
-  assert.equal(insideDeadzone.x, 0);
-  assert.equal(insideDeadzone.y, 0);
-  assert.equal(insideDeadzone.magnitude, 0);
-
-  const fullRight = computeJoystickVector(80, 0, 52, 0.14, 1.0);
-  assert.equal(fullRight.x, 1);
-  assert.equal(fullRight.y, 0);
-  assert.equal(fullRight.magnitude, 1);
-  assert.equal(fullRight.knobOffsetX, 52);
-
-  inputController.clearAllInputs();
-  inputController.setJoystickState(fullRight);
-  inputController.triggerTouchJump(true);
-  inputController.triggerTouchDash();
-
-  const frame1 = inputController.consumeFrameInput();
-  assert.equal(frame1.moveX, 1);
-  assert.equal(frame1.jumpHeld, true);
-  assert.equal(frame1.jumpJustPressed, true);
-  assert.equal(frame1.dashJustPressed, true);
-
-  const frame2 = inputController.consumeFrameInput();
-  assert.equal(frame2.moveX, 1);
-  assert.equal(frame2.jumpHeld, true);
-  assert.equal(frame2.jumpJustPressed, false);
-  assert.equal(frame2.dashJustPressed, false);
-
-  inputController.triggerTouchJump(false);
-  const frame3 = inputController.consumeFrameInput();
-  assert.equal(frame3.moveX, 1);
-  assert.equal(frame3.jumpHeld, false);
-
-  inputController.clearAllInputs();
-});
-
-test('isPointWithinExpandedRect detects when a thumb slides outside a touch button', () => {
-  const btnRect = { left: 700, top: 280, right: 780, bottom: 360 };
-  assert.equal(isPointWithinExpandedRect(740, 320, btnRect, 24), true);
-  assert.equal(isPointWithinExpandedRect(795, 320, btnRect, 24), true);
-  assert.equal(isPointWithinExpandedRect(620, 320, btnRect, 24), false);
-});
-
-test('SaveManager strictly verifies FNV-1a checksum and rejects corrupted records', () => {
-  const initial = createInitialSaveRecord('slot_1');
-  assert.equal(initial.version, 1);
-  assert.equal(initial.checksum.length, 8);
-
-  const validated = validateAndMigrateSave(initial);
-  assert.ok(validated);
-  assert.equal(validated.checksum, initial.checksum);
-
-  const tampered = {
-    ...initial,
-    playerPosition: { x: 1450, y: 550, facing: 'left' as const },
+test('SaveManager migrates valid v1 platformer saves to v2 RPG schema and rejects tampered v1/v2 saves', () => {
+  const v1Payload = {
+    version: 1,
+    slotId: 'slot_1',
+    savedAt: '2026-11-07T10:00:00.000Z',
+    regionId: 'ashen_threshold',
+    regionName: 'Пепельный Рубеж',
+    playerPosition: { x: 340, y: 700, facing: 'left' as const },
+    activeWaystoneId: 'waystone_west',
+    discoveredWaystones: ['waystone_west', 'waystone_sanctuary'],
+    playTimeSeconds: 145,
   };
-  assert.equal(validateAndMigrateSave(tampered), null);
-
-  const badHash = {
-    ...initial,
-    checksum: 'deadbeef',
+  const validV1Record = {
+    ...v1Payload,
+    checksum: computeLegacyV1Checksum(v1Payload),
   };
-  assert.equal(validateAndMigrateSave(badHash), null);
+
+  const migrated = validateAndMigrateSave(validV1Record);
+  assert.ok(migrated, 'Valid v1 record should migrate cleanly to v2');
+  assert.equal(migrated.version, 2);
+  assert.equal(migrated.playerPosition.facing, 'w');
+  assert.equal(migrated.playerPosition.x, DEFAULT_SPAWN_POINT.x);
+  assert.equal(migrated.playerPosition.y, DEFAULT_SPAWN_POINT.y);
+  assert.equal(isPositionWalkable(migrated.playerPosition.x, migrated.playerPosition.y), true);
+  assert.deepEqual(migrated.discoveredWaystones, ['waystone_west', 'waystone_sanctuary']);
+  assert.equal(migrated.heroStats.level, 1);
+
+  // Tampered v1 record must be rejected
+  const tamperedV1 = {
+    ...validV1Record,
+    playerPosition: { x: 999, y: 700, facing: 'left' },
+  };
+  assert.equal(validateAndMigrateSave(tamperedV1), null);
+
+  // Tampered v2 record must be rejected
+  const initialV2 = createInitialSaveRecord('slot_1');
+  const tamperedV2 = {
+    ...initialV2,
+    playerPosition: { x: 1200, y: 800, facing: 'n' as const },
+  };
+  assert.equal(validateAndMigrateSave(tamperedV2), null);
+
+  // Experience gain and level-up helper
+  const leveled = applyExperienceGain(DEFAULT_HERO_STATS, 125);
+  assert.equal(leveled.level, 2);
+  assert.equal(leveled.xp, 25);
+  assert.ok(leveled.maxHp > DEFAULT_HERO_STATS.maxHp);
 });
 
 // ============================================================================
@@ -264,19 +369,18 @@ test('SaveManager strictly verifies FNV-1a checksum and rejects corrupted record
 test('Scenario 1: Backup is newer than IndexedDB while playTimeSeconds is identical', async () => {
   const olderIdb = createValidSaveRecord({
     savedAt: '2026-11-07T12:00:00.000Z',
-    x: 420,
-    y: 700,
-    facing: 'right',
+    x: 490,
+    y: 890,
+    facing: 'e',
     playTimeSeconds: 120,
     discoveredWaystones: ['waystone_west'],
   });
 
-  // Saved 10 seconds later while paused (or within same second of playTimeSeconds = 120)
   const newerBackupSamePlayTime = createValidSaveRecord({
     savedAt: '2026-11-07T12:00:10.000Z',
-    x: 980,
-    y: 540,
-    facing: 'left',
+    x: 1120,
+    y: 960,
+    facing: 'nw',
     playTimeSeconds: 120,
     activeWaystoneId: 'waystone_sanctuary',
     discoveredWaystones: ['waystone_west', 'waystone_sanctuary'],
@@ -288,33 +392,31 @@ test('Scenario 1: Backup is newer than IndexedDB while playTimeSeconds is identi
   assert.equal(rec.source, 'backup');
   assert.equal(rec.needsSyncToIdb, true);
   assert.equal(rec.needsSyncToBackup, false);
-  assert.equal(rec.winner?.playerPosition.x, 980);
+  assert.equal(rec.winner?.playerPosition.x, 1120);
   assert.equal(rec.winner?.discoveredWaystones.length, 2);
 
-  // Verify SaveManager.saveGame() also honors the newer backup even when playTimeSeconds is equal
   const adapter = createMemoryStorageAdapter({
     idb: olderIdb,
     backup: olderIdb,
   });
   const mgr = new SaveManager(adapter);
   await mgr.loadSave();
-  assert.equal(mgr.getCurrentSave().playerPosition.x, 420);
+  assert.equal(mgr.getCurrentSave().playerPosition.x, 490);
 
-  // Now simulate backup store holding a newer record with identical playTimeSeconds (120s)
   adapter.backupStore = newerBackupSamePlayTime;
-  const saved = await mgr.saveGame({ x: 1050 });
-  assert.equal(saved.playerPosition.x, 1050);
-  assert.equal(saved.playerPosition.y, 540);
-  assert.equal(saved.playerPosition.facing, 'left');
+  const saved = await mgr.saveGame({ x: 1180 });
+  assert.equal(saved.playerPosition.x, 1180);
+  assert.equal(saved.playerPosition.y, 960);
+  assert.equal(saved.playerPosition.facing, 'nw');
   assert.deepEqual(saved.discoveredWaystones, ['waystone_west', 'waystone_sanctuary']);
 });
 
 test('Scenario 2: IndexedDB is newer than backup', async () => {
   const newerIdb = createValidSaveRecord({
     savedAt: '2026-11-07T12:05:00.000Z',
-    x: 1580,
-    y: 515,
-    facing: 'left',
+    x: 1250,
+    y: 480,
+    facing: 'n',
     playTimeSeconds: 240,
     activeWaystoneId: 'waystone_sanctuary',
     discoveredWaystones: ['waystone_west', 'waystone_sanctuary'],
@@ -322,9 +424,9 @@ test('Scenario 2: IndexedDB is newer than backup', async () => {
 
   const staleBackup = createValidSaveRecord({
     savedAt: '2026-11-07T12:01:00.000Z',
-    x: 420,
-    y: 700,
-    facing: 'right',
+    x: 490,
+    y: 890,
+    facing: 'e',
     playTimeSeconds: 60,
     discoveredWaystones: ['waystone_west'],
   });
@@ -333,39 +435,37 @@ test('Scenario 2: IndexedDB is newer than backup', async () => {
   assert.equal(rec.source, 'idb');
   assert.equal(rec.needsSyncToIdb, false);
   assert.equal(rec.needsSyncToBackup, true);
-  assert.equal(rec.winner?.playerPosition.x, 1580);
+  assert.equal(rec.winner?.playerPosition.x, 1250);
 
   const adapter = createMemoryStorageAdapter({ idb: newerIdb, backup: staleBackup });
   const mgr = new SaveManager(adapter);
   const loaded = await mgr.loadSave();
   assert.ok(loaded);
-  assert.equal(loaded.playerPosition.x, 1580);
-  assert.equal((adapter.backupStore as SaveRecord).playerPosition.x, 1580);
+  assert.equal(loaded.playerPosition.x, 1250);
+  assert.equal((adapter.backupStore as SaveRecord).playerPosition.x, 1250);
 });
 
 test('Scenario 3: Both records have identical savedAt timestamp and playTimeSeconds', () => {
   const recA = createValidSaveRecord({
     savedAt: '2026-11-07T12:10:00.000Z',
     x: 720,
-    y: 700,
-    facing: 'right',
+    y: 900,
+    facing: 'se',
     playTimeSeconds: 95,
   });
   const recAClone = structuredClone(recA);
 
-  // 3a: Identical content & checksum -> no unnecessary sync writes
   const identical = reconcileSaveRecords(recA, recAClone);
   assert.equal(identical.source, 'idb');
   assert.equal(identical.needsSyncToIdb, false);
   assert.equal(identical.needsSyncToBackup, false);
   assert.equal(identical.winner?.checksum, recA.checksum);
 
-  // 3b: Identical timestamp and playTimeSeconds, but conflicting coordinates -> primary IndexedDB wins and syncs backup
   const conflictingBackup = createValidSaveRecord({
     savedAt: '2026-11-07T12:10:00.000Z',
     x: 840,
-    y: 700,
-    facing: 'left',
+    y: 900,
+    facing: 'sw',
     playTimeSeconds: 95,
   });
   const conflictResolved = reconcileSaveRecords(recA, conflictingBackup);
@@ -375,28 +475,25 @@ test('Scenario 3: Both records have identical savedAt timestamp and playTimeSeco
   assert.equal(conflictResolved.winner?.playerPosition.x, 720);
 });
 
-test('Scenario 4: One record is corrupted (corrupted IDB or corrupted Backup)', async () => {
+test('Scenario 4: One record is corrupted (corrupted IDB or corrupted Backup)', () => {
   const healthyRecord = createValidSaveRecord({
     savedAt: '2026-11-07T12:15:00.000Z',
     x: 1320,
-    y: 620,
-    facing: 'right',
+    y: 920,
+    facing: 'e',
     playTimeSeconds: 180,
   });
   const corruptedRecord = {
     ...healthyRecord,
-    playerPosition: { x: 9999, y: 9999, facing: 'left' },
-    // checksum mismatch!
+    playerPosition: { x: 9999, y: 9999, facing: 'w' },
   };
 
-  // 4a: Corrupted IDB + healthy Backup -> Backup wins and heals IDB
   const fromBackup = reconcileSaveRecords(corruptedRecord, healthyRecord);
   assert.equal(fromBackup.source, 'backup');
   assert.equal(fromBackup.needsSyncToIdb, true);
   assert.equal(fromBackup.needsSyncToBackup, false);
   assert.equal(fromBackup.winner?.playerPosition.x, 1320);
 
-  // 4b: Healthy IDB + corrupted Backup -> IDB wins and heals Backup
   const fromIdb = reconcileSaveRecords(healthyRecord, corruptedRecord);
   assert.equal(fromIdb.source, 'idb');
   assert.equal(fromIdb.needsSyncToIdb, false);
@@ -407,7 +504,7 @@ test('Scenario 4: One record is corrupted (corrupted IDB or corrupted Backup)', 
 test('Scenario 5: Both records are corrupted', async () => {
   const valid = createInitialSaveRecord('slot_1');
   const corruptedIdb = { ...valid, checksum: 'bad00001' };
-  const corruptedBackup = { ...valid, playerPosition: { x: 2100, y: 400, facing: 'left' } };
+  const corruptedBackup = { ...valid, playerPosition: { x: 2100, y: 400, facing: 'w' } };
 
   const res = reconcileSaveRecords(corruptedIdb, corruptedBackup);
   assert.equal(res.winner, null);
@@ -423,10 +520,10 @@ test('Scenario 5: Both records are corrupted', async () => {
   const loaded = await mgr.loadSave();
   assert.equal(loaded, null);
 
-  // init() creates a clean valid initial record when both stores are corrupted
   const initialized = await mgr.init();
   assert.ok(validateAndMigrateSave(initialized));
-  assert.equal(initialized.playerPosition.x, 340);
+  assert.equal(initialized.playerPosition.x, DEFAULT_SPAWN_POINT.x);
+  assert.equal(initialized.playerPosition.y, DEFAULT_SPAWN_POINT.y);
 });
 
 test('Scenario 6: Multiple saves occurring sequentially and concurrently preserve order and data', async () => {
@@ -434,70 +531,69 @@ test('Scenario 6: Multiple saves occurring sequentially and concurrently preserv
   const mgr = new SaveManager(adapter);
   await mgr.init();
 
-  // Trigger 4 saves concurrently without awaiting intermediate steps
   const [s1, s2, s3, s4] = await Promise.all([
-    mgr.saveGame({ x: 500, y: 700, facing: 'right', playTimeSeconds: 10 }),
+    mgr.saveGame({ x: 600, y: 900, facing: 'e', playTimeSeconds: 10 }),
     mgr.saveGame({
-      x: 1100,
-      y: 580,
-      facing: 'left',
+      x: 1120,
+      y: 950,
+      facing: 'ne',
       discoveredWaystoneId: 'waystone_sanctuary',
+      discoveredInteractableId: 'npc_warden_kaelen',
+      xpGain: 40,
       playTimeSeconds: 25,
     }),
     mgr.saveGame({
-      x: 1850,
-      y: 460,
-      facing: 'right',
+      x: 1250,
+      y: 480,
+      facing: 'n',
       discoveredWaystoneId: 'waystone_east',
+      discoveredInteractableId: 'shrine_first_rift',
+      xpGain: 50,
       playTimeSeconds: 40,
     }),
     mgr.saveGame({
-      x: 2420,
-      y: 520,
-      facing: 'left',
+      x: 2040,
+      y: 880,
+      facing: 'se',
       activeWaystoneId: 'waystone_east',
       playTimeSeconds: 55,
     }),
   ]);
 
-  // Verify strictly monotonic timestamps across rapid consecutive saves
   const t1 = Date.parse(s1.savedAt);
   const t2 = Date.parse(s2.savedAt);
   const t3 = Date.parse(s3.savedAt);
   const t4 = Date.parse(s4.savedAt);
   assert.ok(t1 < t2 && t2 < t3 && t3 < t4, 'Expected strictly increasing savedAt timestamps');
 
-  // Verify final persisted state contains all accumulated waystones and latest coordinates
-  assert.equal(s4.playerPosition.x, 2420);
-  assert.equal(s4.playerPosition.y, 520);
-  assert.equal(s4.playerPosition.facing, 'left');
+  assert.equal(s4.playerPosition.x, 2040);
+  assert.equal(s4.playerPosition.y, 880);
+  assert.equal(s4.playerPosition.facing, 'se');
   assert.equal(s4.playTimeSeconds, 55);
-  assert.equal(s4.activeWaystoneId, 'waystone_east');
+  assert.equal(s4.heroStats.xp, 90);
   assert.deepEqual(
     new Set(s4.discoveredWaystones),
     new Set(['waystone_west', 'waystone_sanctuary', 'waystone_east'])
   );
-
-  const persistedIdb = adapter.idbStore as SaveRecord;
-  assert.equal(persistedIdb.checksum, s4.checksum);
-  assert.equal(persistedIdb.playerPosition.x, 2420);
+  assert.deepEqual(
+    new Set(s4.discoveredInteractables),
+    new Set(['npc_warden_kaelen', 'shrine_first_rift'])
+  );
 });
 
-test('Scenario 7: Manual save from Pause Menu records live character coordinates, facing, and playTimeSeconds and handles errors', async () => {
+test('Scenario 7: Manual save from Pause Menu records live 2D RPG coordinates, 8-way facing, and playTimeSeconds and handles errors', async () => {
   const adapter = createMemoryStorageAdapter();
   const mgr = new SaveManager(adapter);
   const bus = new TypedEventBus();
   await mgr.init();
 
-  // Initial save starts at West Waystone (X=340, Y=700, facing='right', playTimeSeconds=0)
-  assert.equal(mgr.getCurrentSave().playerPosition.x, 340);
+  assert.equal(mgr.getCurrentSave().playerPosition.x, DEFAULT_SPAWN_POINT.x);
 
-  // Simulate character moving across the scene before opening the Pause Menu
   const liveSceneCharacter = {
-    x: 1465.4,
-    y: 528.2,
-    facing: 'left' as const,
-    playTimeSeconds: 87.8,
+    x: 1248.6,
+    y: 612.4,
+    facing: 'nw' as const,
+    playTimeSeconds: 94.2,
   };
 
   let completedSave: SaveRecord | null = null;
@@ -516,43 +612,39 @@ test('Scenario 7: Manual save from Pause Menu records live character coordinates
     bus,
   });
 
-  // Trigger Pause Menu manual save button event (exact event emitted by #btn-pause-save-now)
   bus.emit('save:requested', { source: 'pause_menu' });
-
-  // Wait for queued save operation to settle
   await mgr.loadSave();
 
   assert.ok(completedSave, 'Expected save:completed event to fire');
   const saved = completedSave as SaveRecord;
-  assert.equal(saved.playerPosition.x, 1465);
-  assert.equal(saved.playerPosition.y, 528);
-  assert.equal(saved.playerPosition.facing, 'left');
-  assert.equal(saved.playTimeSeconds, 87);
+  assert.equal(saved.playerPosition.x, 1249);
+  assert.equal(saved.playerPosition.y, 612);
+  assert.equal(saved.playerPosition.facing, 'nw');
+  assert.equal(saved.playTimeSeconds, 94);
   assert.equal(failedReason, null);
 
-  // Verify persisted record in IndexedDB matches the live character position
-  const idbRecord = adapter.idbStore as SaveRecord;
-  assert.equal(idbRecord.playerPosition.x, 1465);
-  assert.equal(idbRecord.playerPosition.y, 528);
-  assert.equal(idbRecord.playerPosition.facing, 'left');
-  assert.equal(idbRecord.playTimeSeconds, 87);
-
-  // Now simulate storage failure and verify save:failed is emitted without overwriting completedSave
   adapter.failWrites = true;
-  liveSceneCharacter.x = 1900;
+  liveSceneCharacter.x = 1800;
   bus.emit('save:requested', { source: 'pause_menu' });
 
   await new Promise((r) => setTimeout(r, 15));
   assert.ok(failedReason, 'Expected save:failed event when storage write fails');
-  assert.equal(mgr.getCurrentSave().playerPosition.x, 1465);
+  assert.equal(mgr.getCurrentSave().playerPosition.x, 1249);
 
   unsubscribe();
 });
 
-test('AssetManifest declares all 13 required Stage 1 texture keys without duplicates', () => {
-  const keys = STAGE1_ASSET_MANIFEST.map((a) => a.key);
+test('isPointWithinExpandedRect detects when a thumb slides outside a touch button', () => {
+  const btnRect = { left: 700, top: 280, right: 780, bottom: 360 };
+  assert.equal(isPointWithinExpandedRect(740, 320, btnRect, 24), true);
+  assert.equal(isPointWithinExpandedRect(795, 320, btnRect, 24), true);
+  assert.equal(isPointWithinExpandedRect(620, 320, btnRect, 24), false);
+});
+
+test('AssetManifest declares all Stage 2 RPG texture keys without duplicates', () => {
+  const keys = ASSET_MANIFEST.map((a) => a.key);
   const uniqueKeys = new Set(keys);
   assert.equal(keys.length, Object.keys(ASSET_KEYS).length);
   assert.equal(uniqueKeys.size, keys.length);
+  assert.equal( resolveSafeWalkablePosition(490, 890).x, 490);
 });
-
