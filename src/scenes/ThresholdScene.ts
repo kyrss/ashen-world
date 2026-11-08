@@ -3,7 +3,7 @@ import { GAME_CONFIG, type GameShellState } from '../core/config';
 import { eventBus } from '../core/EventBus';
 import { ASSET_KEYS } from '../gfx/AssetManifest';
 import { inputController } from '../input/InputController';
-import { saveManager } from '../save/SaveManager';
+import { bindLiveSceneSaveHandler, saveManager } from '../save/SaveManager';
 import { soundFX } from '../audio/SoundFX';
 import {
   THRESHOLD_PLATFORMS,
@@ -59,6 +59,7 @@ export class ThresholdScene extends Phaser.Scene {
 
   private unsubscribeState?: () => void;
   private unsubscribeReset?: () => void;
+  private unsubscribeSaveReq?: () => void;
 
   constructor() {
     super({ key: 'ThresholdScene' });
@@ -121,9 +122,27 @@ export class ThresholdScene extends Phaser.Scene {
       this.emitTelemetry(0, undefined, true);
     });
 
+    this.unsubscribeSaveReq = bindLiveSceneSaveHandler({
+      getLiveState: () => ({
+        x: this.seeker.x,
+        y: this.seeker.y,
+        facing: this.facing,
+        playTimeSeconds: this.sessionPlayTimeSec,
+      }),
+      onSaved: (updatedSave, nearestWaystone) => {
+        soundFX.playWaystoneAttune();
+        if (nearestWaystone) {
+          this.spawnDustBurst(nearestWaystone.x, nearestWaystone.y - 16, 12, 0xfbbf24);
+          this.refreshWaystoneVisuals(updatedSave.discoveredWaystones);
+        }
+        this.emitTelemetry(this.time.now, nearestWaystone, true);
+      },
+    });
+
     this.events.once(Phaser.Scenes.Events.SHUTDOWN, () => {
       this.unsubscribeState?.();
       this.unsubscribeReset?.();
+      this.unsubscribeSaveReq?.();
       this.ashPool = [];
       this.dustPool = [];
       this.waystoneSprites.clear();
@@ -546,6 +565,11 @@ export class ThresholdScene extends Phaser.Scene {
           tone: 'amber',
         });
         this.emitTelemetry(this.time.now, ws, true);
+      })
+      .catch((err: unknown) => {
+        const reason =
+          err instanceof Error ? err.message : 'Не удалось записать активацию обелиска';
+        eventBus.emit('save:failed', { reason });
       });
   }
 
@@ -564,6 +588,11 @@ export class ThresholdScene extends Phaser.Scene {
           text: `Локальное сохранение записано (X: ${updatedSave.playerPosition.x}, Y: ${updatedSave.playerPosition.y})`,
           tone: 'cyan',
         });
+      })
+      .catch((err: unknown) => {
+        const reason =
+          err instanceof Error ? err.message : 'Не удалось записать локальное сохранение';
+        eventBus.emit('save:failed', { reason });
       });
   }
 

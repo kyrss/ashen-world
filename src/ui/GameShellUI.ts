@@ -501,11 +501,17 @@ export class GameShellUI {
     const titleResetBtn = this.root.querySelector('#btn-title-reset-save') as HTMLButtonElement;
     titleResetBtn.addEventListener('click', () => {
       titleResetBtn.blur();
-      void saveManager.resetSave().then((fresh) => {
-        eventBus.emit('save:reset', fresh);
-        this.refreshSaveReadouts(fresh);
-        this.showToast('Создана чистая сессия в IndexedDB');
-      });
+      void saveManager
+        .resetSave()
+        .then((fresh) => {
+          eventBus.emit('save:reset', fresh);
+          this.refreshSaveReadouts(fresh);
+          this.showToast('Создана чистая сессия в IndexedDB');
+        })
+        .catch((err: unknown) => {
+          const reason = err instanceof Error ? err.message : 'Сбой сброса сохранения';
+          eventBus.emit('save:failed', { reason });
+        });
     });
 
     window.addEventListener('keydown', (e) => {
@@ -520,7 +526,7 @@ export class GameShellUI {
     const hudSaveBtn = this.root.querySelector('#btn-hud-save') as HTMLButtonElement;
     hudSaveBtn.addEventListener('click', (e) => {
       (e.currentTarget as HTMLElement).blur();
-      inputController.triggerTouchInteract();
+      eventBus.emit('save:requested', { source: 'hud_button' });
     });
 
     this.soundToggleBtnEl.addEventListener('click', (e) => {
@@ -549,20 +555,23 @@ export class GameShellUI {
     const pauseSaveNowBtn = this.root.querySelector('#btn-pause-save-now') as HTMLButtonElement;
     pauseSaveNowBtn.addEventListener('click', () => {
       pauseSaveNowBtn.blur();
-      void saveManager.saveGame().then((saved) => {
-        this.refreshSaveReadouts(saved);
-        this.showToast(`Сохранено в IndexedDB · FNV-1a #${saved.checksum}`);
-      });
+      eventBus.emit('save:requested', { source: 'pause_menu' });
     });
 
     const pauseResetBtn = this.root.querySelector('#btn-pause-reset-save') as HTMLButtonElement;
     pauseResetBtn.addEventListener('click', () => {
       pauseResetBtn.blur();
-      void saveManager.resetSave().then((fresh) => {
-        eventBus.emit('save:reset', fresh);
-        this.refreshSaveReadouts(fresh);
-        this.showToast('Сохранение сброшено к начальной точке Пепельного Рубежа');
-      });
+      void saveManager
+        .resetSave()
+        .then((fresh) => {
+          eventBus.emit('save:reset', fresh);
+          this.refreshSaveReadouts(fresh);
+          this.showToast('Сохранение сброшено к начальной точке Пепельного Рубежа');
+        })
+        .catch((err: unknown) => {
+          const reason = err instanceof Error ? err.message : 'Сбой сброса сохранения';
+          eventBus.emit('save:failed', { reason });
+        });
     });
 
     const pauseToTitleBtn = this.root.querySelector('#btn-pause-to-title') as HTMLButtonElement;
@@ -605,6 +614,10 @@ export class GameShellUI {
 
     eventBus.on('save:completed', (save) => {
       this.refreshSaveReadouts(save);
+    });
+
+    eventBus.on('save:failed', ({ reason }) => {
+      this.showToast(`Ошибка сохранения: ${reason}`);
     });
 
     eventBus.on('toast:message', ({ text }) => {
@@ -881,7 +894,7 @@ export class GameShellUI {
       <div>Регион: ${save.regionName} · Активный якорь: ${wsObj.name}</div>
       <div>Координаты: X=${save.playerPosition.x}, Y=${save.playerPosition.y} · Направление: ${
         save.playerPosition.facing === 'right' ? 'Восток' : 'Запад'
-      }</div>
+      } · Время: ${save.playTimeSeconds}с</div>
       <div>Открыто путевых обелисков: ${save.discoveredWaystones.length} из ${
         THRESHOLD_WAYSTONES.length
       } · Записано в ${formattedTime}</div>

@@ -1,4 +1,11 @@
-import { clampWorldPosition, THRESHOLD_WAYSTONES } from '../world/thresholdLayout';
+import {
+  clampWorldPosition,
+  findNearestWaystone,
+  THRESHOLD_WAYSTONES,
+  type WaystoneSpec,
+} from '../world/thresholdLayout';
+import { eventBus, type TypedEventBus } from '../core/EventBus';
+
 
 export const SAVE_SCHEMA_VERSION = 1;
 export const SAVE_DB_NAME = 'ashen_world_db';
@@ -22,6 +29,15 @@ export interface SaveRecord {
   discoveredWaystones: string[];
   playTimeSeconds: number;
   checksum: string; // 32-bit FNV-1a hex digest
+}
+
+export interface SavePartialUpdate {
+  x?: number;
+  y?: number;
+  facing?: 'left' | 'right';
+  activeWaystoneId?: string;
+  discoveredWaystoneId?: string;
+  playTimeSeconds?: number;
 }
 
 export interface SaveReconciliationResult {
@@ -224,10 +240,43 @@ export function validateAndMigrateSave(raw: unknown): SaveRecord | null {
 }
 
 /**
- * Reconciles primary IndexedDB record and LocalStorage backup record:
+ * Unified comparator for determining which of two valid SaveRecords is newer.
+ * Returns:
+ *  > 0 if record `a` is strictly newer than `b`
+ *  < 0 if record `b` is strictly newer than `a`
+ *    0 if both records have identical timestamps, playTimeSeconds, and discovered progress
+ *
+ * Rules:
+ * 1. Newer `savedAt` ISO timestamp wins (even if `playTimeSeconds` is identical, e.g., saving while paused).
+ * 2. If `savedAt` timestamps are equal, greater `playTimeSeconds` wins.
+ * 3. If both `savedAt` and `playTimeSeconds` are equal, more `discoveredWaystones` wins.
+ */
+export function compareSaveFreshness(a: SaveRecord, b: SaveRecord): number {
+  const timeA = Date.parse(a.savedAt) || 0;
+  const timeB = Date.parse(b.savedAt) || 0;
+  if (timeA !== timeB) {
+    return timeA - timeB;
+  }
+
+  if (a.playTimeSeconds !== b.playTimeSeconds) {
+    return a.playTimeSeconds - b.playTimeSeconds;
+  }
+
+  if (a.discoveredWaystones.length !== b.discoveredWaystones.length) {
+    return a.discoveredWaystones.length - b.discoveredWaystones.length;
+  }
+
+  return 0;
+}
+
+/**
+ * Reconciles primary IndexedDB record and LocalStorage backup record using unified freshness rules:
  * - Never allows a corrupted record to overwrite a healthy backup.
- * - If both records are valid, selects the fresher one (by savedAt timestamp and playTimeSeconds)
- *   and flags the lagging store for synchronization.
+ * - If both records are valid, uses `compareSaveFreshness` so a newer backup with identical playTimeSeconds
+ *   still wins over an older IndexedDB record.
+ * - If both records have identical timestamps and playTimeSeconds:
+ *   - If their checksums match, no sync is required.
+ *   - If their contents differ (conflict at identical timestamp), primary IndexedDB wins and syncs backup.
  */
 export function reconcileSaveRecords(
   idbRaw: unknown,
@@ -263,27 +312,13 @@ export function reconcileSaveRecords(
     };
   }
 
-  // Both validIdb and validBackup exist; compare freshness
   const idbRecord = validIdb!;
   const backupRecord = validBackup!;
 
-  if (idbRecord.checksum === backupRecord.checksum && idbRecord.savedAt === backupRecord.savedAt) {
-    return {
-      winner: idbRecord,
-      source: 'idb',
-      needsSyncToIdb: false,
-      needsSyncToBackup: false,
-    };
-  }
+  const cmp = compareSaveFreshness(backupRecord, idbRecord);
 
-  const idbTime = Date.parse(idbRecord.savedAt) || 0;
-  const backupTime = Date.parse(backupRecord.savedAt) || 0;
-
-  const backupIsNewer =
-    backupTime > idbTime ||
-    (backupTime === idbTime && backupRecord.playTimeSeconds > idbRecord.playTimeSeconds);
-
-  if (backupIsNewer) {
+  if (cmp > 0) {
+    // Backup is strictly newer than IndexedDB (even if playTimeSeconds is equal)
     return {
       winner: backupRecord,
       source: 'backup',
@@ -292,6 +327,27 @@ export function reconcileSaveRecords(
     };
   }
 
+  if (cmp < 0) {
+    // IndexedDB is strictly newer than Backup
+    return {
+      winner: idbRecord,
+      source: 'idb',
+      needsSyncToIdb: false,
+      needsSyncToBackup: true,
+    };
+  }
+
+  // cmp === 0: identical timestamp, playTimeSeconds, and discovered count
+  if (idbRecord.checksum === backupRecord.checksum) {
+    return {
+      winner: idbRecord,
+      source: 'idb',
+      needsSyncToIdb: false,
+      needsSyncToBackup: false,
+    };
+  }
+
+  // Tie with conflicting content: primary IndexedDB wins and syncs backup for consistency
   return {
     winner: idbRecord,
     source: 'idb',
@@ -300,26 +356,71 @@ export function reconcileSaveRecords(
   };
 }
 
-class SaveManager {
+export interface SaveStorageAdapter {
+  readIdb(slotId: string): Promise<unknown>;
+  readBackup(): unknown;
+  writeStores(
+    record: SaveRecord,
+    writeIdb: boolean,
+    writeBackup: boolean
+  ): Promise<{ idbWritten: boolean; backupWritten: boolean }>;
+}
+
+export interface LivePlayerStateSnapshot {
+  x: number;
+  y: number;
+  facing: 'left' | 'right';
+  playTimeSeconds: number;
+}
+
+export class SaveManager {
   private dbPromise: Promise<IDBDatabase | null> | null = null;
   private currentSave: SaveRecord = createInitialSaveRecord();
   private currentSettings: UserSettings = { ...DEFAULT_USER_SETTINGS };
+  private operationQueue: Promise<unknown> = Promise.resolve();
+  private hasLoadedState = false;
+  private adapter?: SaveStorageAdapter;
+
+  constructor(adapter?: SaveStorageAdapter) {
+    this.adapter = adapter;
+  }
+
+  /**
+   * Enqueues async storage operations in strict FIFO order so concurrent calls to
+   * saveGame / loadSave / resetSave never race or overwrite newer saves with stale writes.
+   */
+  private enqueue<T>(task: () => Promise<T>): Promise<T> {
+    const next = this.operationQueue.then(task, task);
+    this.operationQueue = next.then(
+      () => undefined,
+      () => undefined
+    );
+    return next;
+  }
 
   async init(): Promise<SaveRecord> {
     this.loadSettings();
     const loaded = await this.loadSave(DEFAULT_SLOT_ID);
     if (loaded) {
       this.currentSave = loaded;
+      this.hasLoadedState = true;
       return loaded;
     }
     const initial = createInitialSaveRecord(DEFAULT_SLOT_ID);
-    await this.writeToStores(initial, true, true);
-    this.currentSave = initial;
+    await this.enqueue(async () => {
+      await this.writeToStores(initial, true, true);
+      this.currentSave = initial;
+      this.hasLoadedState = true;
+    });
     return initial;
   }
 
   getCurrentSave(): SaveRecord {
-    return this.currentSave;
+    return {
+      ...this.currentSave,
+      playerPosition: { ...this.currentSave.playerPosition },
+      discoveredWaystones: [...this.currentSave.discoveredWaystones],
+    };
   }
 
   getSettings(): UserSettings {
@@ -405,7 +506,10 @@ class SaveManager {
     return this.dbPromise;
   }
 
-  private async readFromIdb(slotId: string): Promise<unknown> {
+  protected async readFromIdb(slotId: string): Promise<unknown> {
+    if (this.adapter) {
+      return this.adapter.readIdb(slotId);
+    }
     const db = await this.openDatabase();
     if (!db) return null;
 
@@ -422,7 +526,10 @@ class SaveManager {
     });
   }
 
-  private readFromBackup(): unknown {
+  protected readFromBackup(): unknown {
+    if (this.adapter) {
+      return this.adapter.readBackup();
+    }
     try {
       if (typeof window !== 'undefined' && window.localStorage) {
         const raw = window.localStorage.getItem(FALLBACK_SAVE_STORAGE_KEY);
@@ -436,23 +543,30 @@ class SaveManager {
     return null;
   }
 
-  private async writeToStores(
+  protected async writeToStores(
     record: SaveRecord,
     writeIdb: boolean,
     writeBackup: boolean
-  ): Promise<void> {
+  ): Promise<{ idbWritten: boolean; backupWritten: boolean }> {
+    if (this.adapter) {
+      return this.adapter.writeStores(record, writeIdb, writeBackup);
+    }
+
+    let idbWritten = false;
+    let backupWritten = false;
+
     if (writeIdb) {
       const db = await this.openDatabase();
       if (db) {
-        await new Promise<void>((resolve) => {
+        idbWritten = await new Promise<boolean>((resolve) => {
           try {
             const tx = db.transaction(SAVE_STORE_NAME, 'readwrite');
             const store = tx.objectStore(SAVE_STORE_NAME);
             store.put(record);
-            tx.oncomplete = () => resolve();
-            tx.onerror = () => resolve();
+            tx.oncomplete = () => resolve(true);
+            tx.onerror = () => resolve(false);
           } catch {
-            resolve();
+            resolve(false);
           }
         });
       }
@@ -462,105 +576,187 @@ class SaveManager {
       try {
         if (typeof window !== 'undefined' && window.localStorage) {
           window.localStorage.setItem(FALLBACK_SAVE_STORAGE_KEY, JSON.stringify(record));
+          backupWritten = true;
         }
       } catch {
-        // Ignore storage quota error
+        backupWritten = false;
       }
     }
+
+    return { idbWritten, backupWritten };
   }
 
   async loadSave(slotId: string = DEFAULT_SLOT_ID): Promise<SaveRecord | null> {
-    const idbRaw = await this.readFromIdb(slotId);
-    const backupRaw = this.readFromBackup();
+    return this.enqueue(async () => {
+      const idbRaw = await this.readFromIdb(slotId);
+      const backupRaw = this.readFromBackup();
 
-    const reconciled = reconcileSaveRecords(idbRaw, backupRaw);
-    if (!reconciled.winner) {
-      return null;
-    }
+      const reconciled = reconcileSaveRecords(idbRaw, backupRaw);
+      if (!reconciled.winner) {
+        return null;
+      }
 
-    this.currentSave = reconciled.winner;
+      this.currentSave = reconciled.winner;
+      this.hasLoadedState = true;
 
-    // Heal whichever storage was missing, corrupted, or stale
-    if (reconciled.needsSyncToIdb || reconciled.needsSyncToBackup) {
-      await this.writeToStores(
-        reconciled.winner,
-        reconciled.needsSyncToIdb,
-        reconciled.needsSyncToBackup
-      );
-    }
+      if (reconciled.needsSyncToIdb || reconciled.needsSyncToBackup) {
+        await this.writeToStores(
+          reconciled.winner,
+          reconciled.needsSyncToIdb,
+          reconciled.needsSyncToBackup
+        );
+      }
 
-    return reconciled.winner;
+      return this.getCurrentSave();
+    });
   }
 
-  async saveGame(partialUpdate?: {
-    x?: number;
-    y?: number;
-    facing?: 'left' | 'right';
-    activeWaystoneId?: string;
-    discoveredWaystoneId?: string;
-    playTimeSeconds?: number;
-  }): Promise<SaveRecord> {
-    // Reconcile against any newer backup before writing so we never clobber fresher data
-    const existingBackup = validateAndMigrateSave(this.readFromBackup());
-    if (existingBackup) {
-      const currTime = Date.parse(this.currentSave.savedAt) || 0;
-      const backTime = Date.parse(existingBackup.savedAt) || 0;
-      if (backTime > currTime && existingBackup.playTimeSeconds > this.currentSave.playTimeSeconds) {
-        this.currentSave = existingBackup;
+  async saveGame(partialUpdate?: SavePartialUpdate): Promise<SaveRecord> {
+    return this.enqueue(async () => {
+      // Reconcile both stores and in-memory state using the unified freshness comparator
+      const idbRaw = await this.readFromIdb(this.currentSave.slotId || DEFAULT_SLOT_ID);
+      const backupRaw = this.readFromBackup();
+      const storedReconciled = reconcileSaveRecords(idbRaw, backupRaw);
+
+      if (
+        storedReconciled.winner &&
+        (!this.hasLoadedState ||
+          compareSaveFreshness(storedReconciled.winner, this.currentSave) > 0)
+      ) {
+        this.currentSave = storedReconciled.winner;
       }
-    }
+      this.hasLoadedState = true;
 
-    const prev = this.currentSave;
-    const discoveredSet = new Set(prev.discoveredWaystones);
-    if (partialUpdate?.discoveredWaystoneId) {
-      discoveredSet.add(partialUpdate.discoveredWaystoneId);
-    }
+      const prev = this.currentSave;
+      const discoveredSet = new Set(prev.discoveredWaystones);
+      if (partialUpdate?.discoveredWaystoneId) {
+        discoveredSet.add(partialUpdate.discoveredWaystoneId);
+      }
 
-    const rawX = partialUpdate?.x ?? prev.playerPosition.x;
-    const rawY = partialUpdate?.y ?? prev.playerPosition.y;
-    const clamped = clampWorldPosition(rawX, rawY);
+      const rawX = partialUpdate?.x ?? prev.playerPosition.x;
+      const rawY = partialUpdate?.y ?? prev.playerPosition.y;
+      const clamped = clampWorldPosition(rawX, rawY);
 
-    // Guarantee monotonically non-decreasing timestamp and playTimeSeconds
-    const prevTimestampMs = Date.parse(prev.savedAt) || 0;
-    const nextTimestampMs = Math.max(Date.now(), prevTimestampMs + 1);
-    const nextPlayTime =
-      partialUpdate?.playTimeSeconds !== undefined
-        ? Math.max(prev.playTimeSeconds, Math.floor(partialUpdate.playTimeSeconds))
-        : prev.playTimeSeconds;
+      // Guarantee monotonically increasing timestamp so sequential saves within the same millisecond are strictly ordered
+      const prevTimestampMs = Date.parse(prev.savedAt) || 0;
+      const nextTimestampMs = Math.max(Date.now(), prevTimestampMs + 1);
+      const nextPlayTime =
+        partialUpdate?.playTimeSeconds !== undefined
+          ? Math.max(prev.playTimeSeconds, Math.floor(partialUpdate.playTimeSeconds))
+          : prev.playTimeSeconds;
 
-    const nextWithoutChecksum: Omit<SaveRecord, 'checksum'> = {
-      version: SAVE_SCHEMA_VERSION,
-      slotId: prev.slotId || DEFAULT_SLOT_ID,
-      savedAt: new Date(nextTimestampMs).toISOString(),
-      regionId: 'ashen_threshold',
-      regionName: 'Пепельный Рубеж',
-      playerPosition: {
-        x: clamped.x,
-        y: clamped.y,
-        facing: partialUpdate?.facing ?? prev.playerPosition.facing,
-      },
-      activeWaystoneId: partialUpdate?.activeWaystoneId ?? prev.activeWaystoneId,
-      discoveredWaystones: Array.from(discoveredSet),
-      playTimeSeconds: nextPlayTime,
-    };
+      const nextWithoutChecksum: Omit<SaveRecord, 'checksum'> = {
+        version: SAVE_SCHEMA_VERSION,
+        slotId: prev.slotId || DEFAULT_SLOT_ID,
+        savedAt: new Date(nextTimestampMs).toISOString(),
+        regionId: 'ashen_threshold',
+        regionName: 'Пепельный Рубеж',
+        playerPosition: {
+          x: clamped.x,
+          y: clamped.y,
+          facing: partialUpdate?.facing ?? prev.playerPosition.facing,
+        },
+        activeWaystoneId: partialUpdate?.activeWaystoneId ?? prev.activeWaystoneId,
+        discoveredWaystones: Array.from(discoveredSet),
+        playTimeSeconds: nextPlayTime,
+      };
 
-    const nextRecord: SaveRecord = {
-      ...nextWithoutChecksum,
-      checksum: computeSaveChecksum(nextWithoutChecksum),
-    };
+      const nextRecord: SaveRecord = {
+        ...nextWithoutChecksum,
+        checksum: computeSaveChecksum(nextWithoutChecksum),
+      };
 
-    this.currentSave = nextRecord;
-    await this.writeToStores(nextRecord, true, true);
+      const writeRes = await this.writeToStores(nextRecord, true, true);
+      if ((typeof window !== 'undefined' || this.adapter) && !writeRes.idbWritten && !writeRes.backupWritten) {
+        throw new Error('Не удалось записать сохранение ни в IndexedDB, ни в резервное хранилище');
+      }
 
-    return nextRecord;
+      this.currentSave = nextRecord;
+      return this.getCurrentSave();
+    });
   }
 
   async resetSave(slotId: string = DEFAULT_SLOT_ID): Promise<SaveRecord> {
-    const fresh = createInitialSaveRecord(slotId);
-    this.currentSave = fresh;
-    await this.writeToStores(fresh, true, true);
-    return fresh;
+    return this.enqueue(async () => {
+      const fresh = createInitialSaveRecord(slotId);
+      const writeRes = await this.writeToStores(fresh, true, true);
+      if ((typeof window !== 'undefined' || this.adapter) && !writeRes.idbWritten && !writeRes.backupWritten) {
+        throw new Error('Не удалось сбросить сохранение в хранилище');
+      }
+      this.currentSave = fresh;
+      this.hasLoadedState = true;
+      return this.getCurrentSave();
+    });
   }
 }
 
 export const saveManager = new SaveManager();
+
+/**
+ * Modular coordinator that binds a scene's live character state provider to `save:requested` events
+ * without exposing Phaser internals to the UI layer.
+ */
+export function bindLiveSceneSaveHandler(options: {
+  getLiveState: () => LivePlayerStateSnapshot;
+  manager?: SaveManager;
+  bus?: TypedEventBus;
+  onSaved?: (
+    updatedSave: SaveRecord,
+    nearestWaystone: WaystoneSpec | null,
+    source: 'pause_menu' | 'hud_button'
+  ) => void;
+}): () => void {
+  const mgr = options.manager ?? saveManager;
+  const targetBus = options.bus ?? eventBus;
+
+  return targetBus.on('save:requested', ({ source }) => {
+    let live: LivePlayerStateSnapshot;
+    try {
+      live = options.getLiveState();
+    } catch (err) {
+      const reason = err instanceof Error ? err.message : 'Не удалось считать координаты сцены';
+      targetBus.emit('save:failed', { reason });
+      return;
+    }
+
+    const nearest = findNearestWaystone(live.x, live.y);
+    void mgr
+      .saveGame({
+        x: live.x,
+        y: live.y,
+        facing: live.facing,
+        playTimeSeconds: live.playTimeSeconds,
+        ...(nearest
+          ? {
+              activeWaystoneId: nearest.id,
+              discoveredWaystoneId: nearest.id,
+            }
+          : {}),
+      })
+      .then((updatedSave) => {
+        options.onSaved?.(updatedSave, nearest, source);
+        if (nearest) {
+          targetBus.emit('waystone:attuned', {
+            id: nearest.id,
+            name: nearest.name,
+            save: updatedSave,
+          });
+        }
+        targetBus.emit('save:completed', updatedSave);
+        targetBus.emit('toast:message', {
+          text:
+            source === 'pause_menu'
+              ? `Сохранено в IndexedDB (X: ${updatedSave.playerPosition.x}, Y: ${updatedSave.playerPosition.y}) · FNV-1a #${updatedSave.checksum}`
+              : nearest
+                ? `Обелиск активирован: ${nearest.name} · Прогресс сохранён`
+                : `Локальное сохранение записано (X: ${updatedSave.playerPosition.x}, Y: ${updatedSave.playerPosition.y})`,
+          tone: nearest ? 'amber' : 'cyan',
+        });
+      })
+      .catch((err: unknown) => {
+        const reason =
+          err instanceof Error ? err.message : 'Не удалось записать сохранение в хранилище';
+        targetBus.emit('save:failed', { reason });
+      });
+  });
+}

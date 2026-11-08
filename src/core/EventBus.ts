@@ -21,7 +21,9 @@ export interface AshenEvents {
   'state:changed': GameShellState;
   'telemetry:updated': TelemetrySnapshot;
   'waystone:attuned': { id: string; name: string; save: SaveRecord };
+  'save:requested': { source: 'pause_menu' | 'hud_button' };
   'save:completed': SaveRecord;
+  'save:failed': { reason: string };
   'save:reset': SaveRecord;
   'settings:changed': UserSettings;
   'toast:message': { text: string; tone: 'amber' | 'cyan' | 'neutral' };
@@ -29,7 +31,7 @@ export interface AshenEvents {
 
 type Handler<T> = (payload: T) => void;
 
-class TypedEventBus {
+export class TypedEventBus {
   private listeners = new Map<keyof AshenEvents, Set<Handler<never>>>();
 
   on<K extends keyof AshenEvents>(event: K, handler: Handler<AshenEvents[K]>): () => void {
@@ -54,3 +56,4 @@ class TypedEventBus {
 }
 
 export const eventBus = new TypedEventBus();
+
